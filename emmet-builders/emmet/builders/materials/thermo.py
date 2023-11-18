@@ -2,7 +2,6 @@ from math import ceil
 import warnings
 from itertools import chain
 from typing import Dict, Iterator, List, Optional, Set
-from datetime import datetime
 
 from maggma.core import Builder, Store
 from maggma.stores import S3Store
@@ -19,9 +18,11 @@ from emmet.core.utils import jsanitize
 class ThermoBuilder(Builder):
     def __init__(
         self,
-        thermo: Store,
-        corrected_entries: Store,
-        phase_diagram: Optional[Store] = None,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        # thermo: Store,
+        # corrected_entries: Store,
+        # phase_diagram: Optional[Store] = None,
         query: Optional[Dict] = None,
         num_phase_diagram_eles: Optional[int] = None,
         chunk_size: int = 1000,
@@ -42,11 +43,16 @@ class ThermoBuilder(Builder):
                 for data within the separate phase_diagram collection
             chunk_size (int): Size of chemsys chunks to process at any one time.
         """
+        self.source_keys = source_keys
+        self.target_keys = target_keys
 
-        self.thermo = thermo
+        self.corrected_entries = source_keys["corrected_entries"]
+        self.thermo = target_keys["thermo"]
+        self.phase_diagram = (
+            target_keys["phase_diagram"] if "phase_diagram" in target_keys else None
+        )
+
         self.query = query if query else {}
-        self.corrected_entries = corrected_entries
-        self.phase_diagram = phase_diagram
         self.num_phase_diagram_eles = num_phase_diagram_eles
         self.chunk_size = chunk_size
         self._completed_tasks: Set[str] = set()
@@ -70,7 +76,8 @@ class ThermoBuilder(Builder):
         if self.phase_diagram is not None:
             if self.phase_diagram.key != "phase_diagram_id":
                 warnings.warn(
-                    f"Key for the phase diagram store is incorrect and has been changed from {self.phase_diagram.key} to phase_diagram_id!"  # noqa: E501
+                    f"Key for the phase diagram store is incorrect and has been changed from {self.phase_diagram.key} to phase_diagram_id!"
+                    # noqa: E501
                 )
                 self.phase_diagram.key = "phase_diagram_id"
 
@@ -136,13 +143,27 @@ class ThermoBuilder(Builder):
         )
         self.total = len(to_process_chemsys)
 
+        return [
+            to_process_chemsys[i : i + self.chunk_size]
+            for i in range(0, len(to_process_chemsys), self.chunk_size)
+        ]
+
         # Yield the chemical systems in order of increasing size
         # Will build them in a similar manner to fast Pourbaix
-        for chemsys in sorted(
-            to_process_chemsys, key=lambda x: len(x.split("-")), reverse=False
-        ):
+
+    #        for chemsys in sorted(
+    #            to_process_chemsys, key=lambda x: len(x.split("-")), reverse=False
+    #        ):
+    #            corrected_entries = self.corrected_entries.query_one({"chemsys": chemsys})
+    #            yield corrected_entries
+
+    def get_processed_docs(self, chemsys):
+        # Yield the chemical systems in order of increasing size
+        # Will build them in a similar manner to fast Pourbaix
+        for sys in sorted(chemsys, key=lambda x: len(x.split("-")), reverse=False):
             corrected_entries = self.corrected_entries.query_one({"chemsys": chemsys})
-            yield corrected_entries
+
+        return corrected_entries
 
     def process_item(self, item):
         if not item:
@@ -199,12 +220,12 @@ class ThermoBuilder(Builder):
                         thermo_type=thermo_type,
                     )
 
-                    pd_data = jsanitize(pd_doc.model_dump(), allow_bson=True)
+                    pd_data = jsanitize(pd_doc.dict(), allow_bson=True)
 
                     pd_docs = [pd_data]
 
             docs_pd_pair = (
-                jsanitize([d.model_dump() for d in docs], allow_bson=True),
+                jsanitize([d.dict() for d in docs], allow_bson=True),
                 pd_docs,
             )
 
@@ -285,9 +306,9 @@ class ThermoBuilder(Builder):
             for chemsys in corrected_entries_chemsys_dates
             if (chemsys not in thermo_chemsys_dates)
             or (
-                thermo_chemsys_dates[chemsys]
-                < datetime.fromisoformat(corrected_entries_chemsys_dates[chemsys])
+                thermo_chemsys_dates[chemsys] < corrected_entries_chemsys_dates[chemsys]
             )
         ]
 
         return to_process_chemsys
+
