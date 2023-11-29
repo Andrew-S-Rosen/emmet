@@ -1,5 +1,5 @@
 from math import ceil
-from typing import Dict, Optional, Iterator
+from typing import Dict, Iterator, Optional
 
 import numpy as np
 from maggma.builders import Builder
@@ -60,7 +60,7 @@ class DielectricBuilder(Builder):
         Gets all items to process
 
         Returns:
-            generator or list relevant tasks and materials to process
+            list of relevant tasks and materials to process
         """
 
         self.logger.info("Dielectric Builder Started")
@@ -226,4 +226,3 @@ class DielectricBuilder(Builder):
             print("No items to update")
 
         self.dielectric.close()
-
