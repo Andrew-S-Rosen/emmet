@@ -13,10 +13,11 @@ from emmet.core.utils import jsanitize
 class OptimadeMaterialsBuilder(Builder):
     def __init__(
         self,
-        materials: Store,
-        thermo: Store,
-        optimade: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         query: Optional[Dict] = None,
+        chunk_size: int = 300,
+        allow_bson=True,
         **kwargs,
     ):
         """
@@ -28,10 +29,14 @@ class OptimadeMaterialsBuilder(Builder):
             optimade: Store to update with optimade document
             query : query on materials to limit search
         """
+        self.source_keys = source_keys
+        self.target_keys = target_keys
 
-        self.materials = materials
-        self.thermo = thermo
-        self.optimade = optimade
+        self.materials = source_keys["materials"]
+        self.thermo = source_keys["thermo"]
+        self.optimade = target_keys["optimade"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query or {}
         self.kwargs = kwargs
 
@@ -40,7 +45,12 @@ class OptimadeMaterialsBuilder(Builder):
         self.thermo.key = "material_id"
         self.optimade.key = "material_id"
 
-        super().__init__(sources=[materials, thermo], targets=optimade, **kwargs)
+        super().__init__(
+            sources=[self.materials, self.thermo],
+            targets=self.optimade,
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
 
     def prechunk(self, number_splits: int) -> Iterator[Dict]:  # pragma: no cover
         """
@@ -81,45 +91,104 @@ class OptimadeMaterialsBuilder(Builder):
 
         self.logger.info(f"Processing {self.total} items")
 
+        return [
+            mat_ids[i : i + self.chunk_size]
+            for i in range(0, len(mat_ids), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        self.materials.connect()
+        self.thermo.connect()
+
+        all_docs = []
+
         for mat in mats:
-            doc = self._get_processed_doc(mat)
+            mat_doc = self.materials.query_one(
+                {self.materials.key: mat},
+                [self.materials.key, "last_updated", "structure"],
+            )
 
-            if doc is not None:
-                yield doc
-            else:
-                pass
-
-    def process_item(self, item):
-        mpid = item["mat_doc"]["material_id"]
-        structure = Structure.from_dict(item["mat_doc"]["structure"])
-        last_updated_structure = item["mat_doc"]["last_updated"]
-
-        # Functional names must be lowercase to adhere to optimade spec for querying attributes
-        thermo_calcs = {}
-        if item["thermo_doc"]:
-            for doc in item["thermo_doc"]:
-                thermo_calcs[doc["thermo_type"].lower()] = {
-                    "thermo_id": doc["thermo_id"],
-                    "energy_above_hull": doc["energy_above_hull"],
-                    "formation_energy_per_atom": doc["formation_energy_per_atom"],
-                    "last_updated_thermo": doc["last_updated"],
+            mat_doc.update(
+                {
+                    self.materials.key: mat_doc[self.materials.key],
                 }
+            )
 
-        optimade_doc = OptimadeMaterialsDoc.from_structure(
-            material_id=mpid,
-            structure=structure,
-            last_updated_structure=last_updated_structure,
-            thermo_calcs=thermo_calcs,
-        )
+            # Query thermo store for all docs matching material_id to catch
+            # multiple stability calculations for the same material_id
+            thermo_docs = self.thermo.query(
+                {self.thermo.key: mat},
+                [
+                    self.thermo.key,
+                    "thermo_type",
+                    "thermo_id",
+                    "energy_above_hull",
+                    "formation_energy_per_atom",
+                    "last_updated",
+                ],
+            )
 
-        doc = jsanitize(optimade_doc.model_dump(), allow_bson=True)
+            thermo_list = [doc for doc in thermo_docs]
 
-        return doc
+            if thermo_list:
+                for doc in thermo_list:
+                    doc.update({self.thermo.key: doc[self.thermo.key]})
+
+            combined_doc = {
+                "mat_doc": mat_doc,
+                "thermo_doc": None if not thermo_list else thermo_list,
+            }
+
+            all_docs.append(combined_doc)
+
+        self.materials.close()
+        self.thermo.close()
+
+        return all_docs
+
+    def process_item(self, items):
+        docs = []
+        for item in items:
+            if not item:
+                continue
+
+            mpid = item["mat_doc"]["material_id"]
+            structure = Structure.from_dict(item["mat_doc"]["structure"])
+            last_updated_structure = item["mat_doc"]["last_updated"]
+
+            # Functional names must be lowercase to adhere to optimade spec for querying attributes
+            thermo_calcs = {}
+            if item["thermo_doc"]:
+                for doc in item["thermo_doc"]:
+                    thermo_calcs[doc["thermo_type"].lower()] = {
+                        "thermo_id": doc["thermo_id"],
+                        "energy_above_hull": doc["energy_above_hull"],
+                        "formation_energy_per_atom": doc["formation_energy_per_atom"],
+                        "last_updated_thermo": doc["last_updated"],
+                    }
+
+            optimade_doc = OptimadeMaterialsDoc.from_structure(
+                material_id=mpid,
+                structure=structure,
+                last_updated_structure=last_updated_structure,
+                thermo_calcs=thermo_calcs,
+            )
+
+            doc = jsanitize(optimade_doc.model_dump(), allow_bson=self.allow_bson)
+
+            docs.append(doc)
+
+        return docs
 
     def update_targets(self, items):
         """
         Inserts the new optimade docs into the optimade collection
         """
+        if not items:
+            return
+
+        self.optimade.connect()
+
         docs = list(filter(None, items))
 
         if len(docs) > 0:
@@ -128,40 +197,4 @@ class OptimadeMaterialsBuilder(Builder):
         else:
             self.logger.info("No items to update")
 
-    def _get_processed_doc(self, mat):
-        mat_doc = self.materials.query_one(
-            {self.materials.key: mat}, [self.materials.key, "last_updated", "structure"]
-        )
-
-        mat_doc.update(
-            {
-                self.materials.key: mat_doc[self.materials.key],
-            }
-        )
-
-        # Query thermo store for all docs matching material_id to catch
-        # multiple stability calculations for the same material_id
-        thermo_docs = self.thermo.query(
-            {self.thermo.key: mat},
-            [
-                self.thermo.key,
-                "thermo_type",
-                "thermo_id",
-                "energy_above_hull",
-                "formation_energy_per_atom",
-                "last_updated",
-            ],
-        )
-
-        thermo_list = [doc for doc in thermo_docs]
-
-        if thermo_list:
-            for doc in thermo_list:
-                doc.update({self.thermo.key: doc[self.thermo.key]})
-
-        combined_doc = {
-            "mat_doc": mat_doc,
-            "thermo_doc": None if not thermo_list else thermo_list,
-        }
-
-        return combined_doc
+        self.optimade.close()
