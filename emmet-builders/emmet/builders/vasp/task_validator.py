@@ -1,23 +1,25 @@
-from typing import Dict, Optional
 from collections import defaultdict
+from typing import Dict, Optional
 
-from maggma.builders import MapBuilder
+from maggma.builders.dag_map_builder import MapBuilder
 from maggma.core import Store
 
 from emmet.builders.settings import EmmetBuildSettings
-from emmet.core.vasp.task_valid import TaskDocument
 from emmet.core.vasp.calc_types.enums import CalcType
+from emmet.core.vasp.task_valid import TaskDocument
 from emmet.core.vasp.validation import DeprecationMessage, ValidationDoc
 
 
 class TaskValidator(MapBuilder):
     def __init__(
         self,
-        tasks: Store,
-        task_validation: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         potcar_hashes: Optional[Dict[CalcType, Dict[str, str]]] = None,
         settings: Optional[EmmetBuildSettings] = None,
         query: Optional[Dict] = None,
+        chunk_size: int = 300,
+        allow_bson=True,
         **kwargs,
     ):
         """
@@ -29,8 +31,11 @@ class TaskValidator(MapBuilder):
             potcar_hashes: Optional dictionary of potcar hash data.
                 Mapping is calculation type -> potcar symbol -> hash value.
         """
-        self.tasks = tasks
-        self.task_validation = task_validation
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.tasks = source_keys["tasks"]
+        self.task_validation = target_keys["task_validation"]
         self.settings = EmmetBuildSettings.autoload(settings)
         self.query = query
         self.kwargs = kwargs
@@ -59,8 +64,9 @@ class TaskValidator(MapBuilder):
             self.potcar_hashes = None
 
         super().__init__(
-            source=tasks,
-            target=task_validation,
+            source=self.tasks,
+            target=self.task_validation,
+            chunk_size=chunk_size,
             projection=[
                 "orig_inputs",
                 "input.hubbards",
