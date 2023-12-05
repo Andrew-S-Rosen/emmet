@@ -1,4 +1,6 @@
-from maggma.builders.map_builder import MapBuilder
+from typing import Dict
+
+from maggma.builders.dag_map_builder import MapBuilder
 from maggma.core import Store
 from pymatgen.core import Structure
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
@@ -10,8 +12,11 @@ from emmet.core.utils import jsanitize
 class BondingBuilder(MapBuilder):
     def __init__(
         self,
-        oxidation_states: Store,
-        bonding: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        query=None,
+        chunk_size: int = 300,
+        allow_bson=True,
         **kwargs,
     ):
         """
@@ -24,16 +29,23 @@ class BondingBuilder(MapBuilder):
             bonding: Store to update with bonding documents
             query : query on materials to limit search
         """
-        self.oxidation_states = oxidation_states
-        self.bonding = bonding
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.oxidation_states = source_keys["oxidation_states"]
+        self.bonding = target_keys["bonding"]
+        self.query = query or {}
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.kwargs = kwargs
 
         # Enforce that we key on material_id
         self.oxidation_states.key = "material_id"
         self.bonding.key = "material_id"
         super().__init__(
-            source=oxidation_states,
-            target=bonding,
+            source=self.oxidation_states,
+            target=self.bonding,
+            chunk_size=self.chunk_size,
             projection=["structure", "deprecated"],
             **kwargs,
         )
@@ -50,6 +62,6 @@ class BondingBuilder(MapBuilder):
         bonding_doc = BondingDoc.from_structure(
             structure=structure, material_id=mpid, deprecated=deprecated
         )
-        doc = jsanitize(bonding_doc.model_dump(), allow_bson=True)
+        doc = jsanitize(bonding_doc.model_dump(), allow_bson=self.allow_bson)
 
         return doc
