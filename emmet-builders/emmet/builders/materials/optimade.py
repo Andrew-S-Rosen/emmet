@@ -92,8 +92,7 @@ class OptimadeMaterialsBuilder(Builder):
         self.logger.info(f"Processing {self.total} items")
 
         return [
-            mat_ids[i : i + self.chunk_size]
-            for i in range(0, len(mat_ids), self.chunk_size)
+            mats[i : i + self.chunk_size] for i in range(0, len(mats), self.chunk_size)
         ]
 
     def get_processed_docs(self, mats):

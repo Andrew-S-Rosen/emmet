@@ -83,8 +83,7 @@ class AbsorptionBuilder(Builder):
         self.total = len(mats)
 
         return [
-            mat_ids[i : i + self.chunk_size]
-            for i in range(0, len(mat_ids), self.chunk_size)
+            mats[i : i + self.chunk_size] for i in range(0, len(mats), self.chunk_size)
         ]
 
     def get_processed_docs(self, mats):
