@@ -1,18 +1,20 @@
-import numpy as np
+from typing import Dict
 
-from pymatgen.core.structure import Structure
-from pymatgen.analysis import local_env
-from emmet.core.structure import StructureMetadata
-from matminer.featurizers.site import CrystalNNFingerprint, CoordinationNumber
+import numpy as np
+from maggma.builders.dag_map_builder import MapBuilder
+from maggma.core import Store
 from matminer.featurizers.composition import ElementProperty
+from matminer.featurizers.site import CoordinationNumber, CrystalNNFingerprint
+from pymatgen.analysis import local_env
+from pymatgen.core.structure import Structure
+
+from emmet.core.structure import StructureMetadata
 
 # TODO:
 # 1) ADD DOCUMENT MODEL
 # 2) Add checking OPs present in current implementation of site fingerprints.
 # 3) Complete documentation!!!
 
-
-from maggma.builders import MapBuilder
 
 __author__ = "Nils E. R. Zimmermann <nerz@lbl.gov>"
 
@@ -31,7 +33,14 @@ nn_target_classes = [
 
 
 class BasicDescriptorsBuilder(MapBuilder):
-    def __init__(self, materials, descriptors, **kwargs):
+    def __init__(
+        self,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        query=None,
+        chunk_size: int = 300,
+        **kwargs
+    ):
         """
         Calculates site-based descriptors (e.g., coordination numbers
         with different near-neighbor finding approaches) for materials and
@@ -44,15 +53,20 @@ class BasicDescriptorsBuilder(MapBuilder):
 
         Args:
             materials (Store): Store of materials documents.
-            descriptors (Store): Store of composition, site, and
+            site_descriptors (Store): Store of composition, site, and
                                  structure descriptor data such
                                  as tetrahedral order parameter or
                                  fraction of being 8-fold coordinated.
-            mat_query (dict): dictionary to limit materials to be analyzed.
+            query (dict): dictionary to limit materials to be analyzed.
         """
+        self.source_keys = source_keys
+        self.target_keys = target_keys
 
-        self.materials = materials
-        self.descriptors = descriptors
+        self.materials = source_keys["materials"]
+        self.descriptors = target_keys["site_descriptors"]
+        self.query = query or {}
+        self.chunk_size = chunk_size
+        self.kwargs = kwargs
 
         # Set up all targeted site descriptors.
         self.sds = {}
@@ -76,7 +90,12 @@ class BasicDescriptorsBuilder(MapBuilder):
         self.all_output_pieces["meta"] = ["atomate"]
 
         super().__init__(
-            source=materials, target=descriptors, projection=["structure"], **kwargs
+            source=self.materials,
+            target=self.descriptors,
+            chunk_size=self.chunk_size,
+            query=self.query,
+            projection=["structure"],
+            **kwargs
         )
 
     def unary_function(self, item):
