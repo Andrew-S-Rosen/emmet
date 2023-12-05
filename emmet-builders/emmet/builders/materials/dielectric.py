@@ -27,9 +27,9 @@ class DielectricBuilder(Builder):
         self.materials = source_keys["materials"]
         self.tasks = source_keys["tasks"]
         self.dielectric = target_keys["dielectric"]
-        self.query = query or {}
         self.chunk_size = chunk_size
         self.allow_bson = allow_bson
+        self.query = query or {}
         self.kwargs = kwargs
 
         self.materials.key = "material_id"
@@ -39,7 +39,7 @@ class DielectricBuilder(Builder):
         super().__init__(
             sources=[self.materials, self.tasks],
             targets=[self.dielectric],
-            chunk_size=chunk_size,
+            chunk_size=self.chunk_size,
             **kwargs,
         )
 
@@ -86,7 +86,9 @@ class DielectricBuilder(Builder):
     def get_processed_docs(self, mats):
         self.materials.connect()
         self.tasks.connect()
+
         all_docs = []
+
         for mat in mats:
             docs = []
 
@@ -179,6 +181,7 @@ class DielectricBuilder(Builder):
 
         self.materials.close()
         self.tasks.close()
+
         return all_docs
 
     def process_item(self, items):
