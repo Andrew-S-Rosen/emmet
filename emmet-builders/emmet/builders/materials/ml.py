@@ -1,7 +1,7 @@
 from importlib.metadata import version
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
-from maggma.builders.map_builder import MapBuilder
+from maggma.builders.dag_map_builder import MapBuilder
 from maggma.core import Store
 from matcalc.util import get_universal_calculator
 from pymatgen.core import Structure
@@ -16,12 +16,14 @@ if TYPE_CHECKING:
 class MLBuilder(MapBuilder):
     def __init__(
         self,
-        materials: Store,
-        ml_potential: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         model: Union[str, "Calculator"],
-        model_kwargs: Optional[dict] = None,
-        prop_kwargs: Optional[dict] = None,
-        provenance: Optional[dict] = None,
+        chunk_size: int = 300,
+        allow_bson=True,
+        model_kwargs: Optional[Dict] = None,
+        prop_kwargs: Optional[Dict] = None,
+        provenance: Optional[Dict] = None,
         **kwargs
     ):
         """Machine learning interatomic potential builder.
@@ -40,9 +42,15 @@ class MLBuilder(MapBuilder):
                 MLDocs. Will be saved in each document so use sparingly. Defaults to None.
                 Set to {} to disable default provenance model_name, model_version, matcalc_version.
         """
-        self.materials = materials
-        self.ml_potential = ml_potential
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.materials = source_keys["materials"]
+        self.ml_potential = target_keys["ml_potential"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.kwargs = kwargs
+
         self.model = get_universal_calculator(model, **(model_kwargs or {}))
         self.prop_kwargs = prop_kwargs or {}
 
@@ -65,8 +73,8 @@ class MLBuilder(MapBuilder):
         self.materials.key = "material_id"
         self.ml_potential.key = "material_id"
         super().__init__(
-            source=materials,
-            target=ml_potential,
+            source=self.materials,
+            target=self.ml_potential,
             projection=["structure", "deprecated"],
             **kwargs,
         )
