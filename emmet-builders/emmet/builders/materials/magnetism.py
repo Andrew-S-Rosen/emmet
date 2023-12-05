@@ -15,10 +15,11 @@ __author__ = "Shyam Dwaraknath <shyamd@lbl.gov>, Matthew Horton <mkhorton@lbl.go
 class MagneticBuilder(Builder):
     def __init__(
         self,
-        materials: Store,
-        magnetism: Store,
-        tasks: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         query: Optional[Dict] = None,
+        chunk_size: int = 300,
+        allow_bson=True,
         **kwargs,
     ):
         """
@@ -29,10 +30,14 @@ class MagneticBuilder(Builder):
             magnetism (Store): Store of magnetism properties
 
         """
+        self.source_keys = source_keys
+        self.target_keys = target_keys
 
-        self.materials = materials
-        self.magnetism = magnetism
-        self.tasks = tasks
+        self.materials = source_keys["materials"]
+        self.tasks = source_keys["tasks"]
+        self.magnetism = target_keys["magnetism"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query or {}
         self.kwargs = kwargs
 
@@ -40,7 +45,13 @@ class MagneticBuilder(Builder):
         self.tasks.key = "task_id"
         self.magnetism.key = "material_id"
 
-        super().__init__(sources=[materials, tasks], targets=[magnetism], **kwargs)
+        super().__init__(
+            sources=[self.materials, self.tasks],
+            targets=[self.magnetism],
+            chunk_size=self.chunk_size,
+            query=self.query,
+            **kwargs,
+        )
 
     def prechunk(self, number_splits: int) -> Iterator[Dict]:  # pragma: no cover
         """
@@ -79,42 +90,97 @@ class MagneticBuilder(Builder):
 
         mats = [mat for mat in mats_set]
 
-        self.logger.info("Processing {} materials for magnetism data".format(len(mats)))
+        self.logger.info(f"Processing {len(mats)} materials for magnetism data")
 
-        self.total = len(mats)
+        return [
+            mat_ids[i : i + self.chunk_size]
+            for i in range(0, len(mat_ids), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        self.materials.connect()
+        self.task.connect()
+
+        all_docs = []
 
         for mat in mats:
-            doc = self._get_processed_doc(mat)
+            mat_doc = self.materials.query_one(
+                {self.materials.key: mat},
+                [
+                    self.materials.key,
+                    "origins",
+                    "last_updated",
+                    "structure",
+                    "deprecated",
+                ],
+            )
 
-            if doc is not None:
-                yield doc
-            else:
-                pass
+            for origin in mat_doc["origins"]:
+                if origin["name"] == "structure":
+                    task_id = origin["task_id"]
 
-    def process_item(self, item):
-        structure = Structure.from_dict(item["structure"])
-        mpid = item["material_id"]
-        origin_entry = {
-            "name": "magnetism",
-            "task_id": item["task_id"],
-            "last_updated": item["task_updated"],
-        }
+            task_query = self.tasks.query_one(
+                properties=["last_updated", "calcs_reversed"],
+                criteria={self.tasks.key: task_id},
+            )
 
-        doc = MagnetismDoc.from_structure(
-            structure=structure,
-            material_id=mpid,
-            total_magnetization=item["total_magnetization"],
-            origins=[origin_entry],
-            deprecated=item["deprecated"],
-            last_updated=item["last_updated"],
-        )
+            task_updated = task_query["last_updated"]
+            total_magnetization = task_query["calcs_reversed"][-1]["output"]["outcar"][
+                "total_magnetization"
+            ]
 
-        return jsanitize(doc.model_dump(), allow_bson=True)
+            mat_doc.update(
+                {
+                    "task_id": task_id,
+                    "total_magnetization": total_magnetization,
+                    "task_updated": task_updated,
+                    self.materials.key: mat_doc[self.materials.key],
+                }
+            )
+
+            all_docs.append(mat_doc)
+
+        self.materials.close()
+        self.tasks.close()
+
+        return all_docs
+
+    def process_item(self, items):
+        docs = []
+        for item in items:
+            if not item:
+                continue
+
+            structure = Structure.from_dict(item["structure"])
+            mpid = item["material_id"]
+            origin_entry = {
+                "name": "magnetism",
+                "task_id": item["task_id"],
+                "last_updated": item["task_updated"],
+            }
+
+            doc = MagnetismDoc.from_structure(
+                structure=structure,
+                material_id=mpid,
+                total_magnetization=item["total_magnetization"],
+                origins=[origin_entry],
+                deprecated=item["deprecated"],
+                last_updated=item["last_updated"],
+            )
+
+            docs.append(jsanitize(doc.model_dump(), allow_bson=self.allow_bson))
+
+        return docs
 
     def update_targets(self, items):
         """
         Inserts the new magnetism docs into the magnetism collection
         """
+        if not items:
+            return
+
+        self.magnetism.connect()
+
         docs = list(filter(None, items))
 
         if len(docs) > 0:
@@ -123,33 +189,4 @@ class MagneticBuilder(Builder):
         else:
             self.logger.info("No items to update")
 
-    def _get_processed_doc(self, mat):
-        mat_doc = self.materials.query_one(
-            {self.materials.key: mat},
-            [self.materials.key, "origins", "last_updated", "structure", "deprecated"],
-        )
-
-        for origin in mat_doc["origins"]:
-            if origin["name"] == "structure":
-                task_id = origin["task_id"]
-
-        task_query = self.tasks.query_one(
-            properties=["last_updated", "calcs_reversed"],
-            criteria={self.tasks.key: task_id},
-        )
-
-        task_updated = task_query["last_updated"]
-        total_magnetization = task_query["calcs_reversed"][-1]["output"]["outcar"][
-            "total_magnetization"
-        ]
-
-        mat_doc.update(
-            {
-                "task_id": task_id,
-                "total_magnetization": total_magnetization,
-                "task_updated": task_updated,
-                self.materials.key: mat_doc[self.materials.key],
-            }
-        )
-
-        return mat_doc
+        self.magnetism.close()
