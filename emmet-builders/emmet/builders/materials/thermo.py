@@ -1,6 +1,6 @@
-from math import ceil
 import warnings
 from itertools import chain
+from math import ceil
 from typing import Dict, Iterator, List, Optional, Set
 
 from maggma.core import Builder, Store
@@ -11,7 +11,7 @@ from pymatgen.analysis.phase_diagram import PhaseDiagramError
 from pymatgen.entries.computed_entries import ComputedStructureEntry
 
 from emmet.builders.utils import HiddenPrints
-from emmet.core.thermo import ThermoDoc, PhaseDiagramDoc
+from emmet.core.thermo import PhaseDiagramDoc, ThermoDoc
 from emmet.core.utils import jsanitize
 
 
@@ -52,7 +52,7 @@ class ThermoBuilder(Builder):
             target_keys["phase_diagram"] if "phase_diagram" in target_keys else None
         )
 
-        self.query = query if query else {}
+        self.query = query or {}
         self.num_phase_diagram_eles = num_phase_diagram_eles
         self.chunk_size = chunk_size
         self._completed_tasks: Set[str] = set()
@@ -70,8 +70,8 @@ class ThermoBuilder(Builder):
             )
             self.corrected_entries.key = "chemsys"
 
-        sources = [corrected_entries]
-        targets = [thermo]
+        sources = [self.corrected_entries]
+        targets = [self.thermo]
 
         if self.phase_diagram is not None:
             if self.phase_diagram.key != "phase_diagram_id":
@@ -81,7 +81,7 @@ class ThermoBuilder(Builder):
                 )
                 self.phase_diagram.key = "phase_diagram_id"
 
-            targets.append(phase_diagram)  # type: ignore
+            targets.append(self.phase_diagram)  # type: ignore
 
         super().__init__(
             sources=sources, targets=targets, chunk_size=chunk_size, **kwargs
@@ -138,32 +138,32 @@ class ThermoBuilder(Builder):
 
         to_process_chemsys = self._get_chemsys_to_process()
 
-        self.logger.info(
-            f"Found {len(to_process_chemsys)} chemical systems with new/updated materials to process"
-        )
         self.total = len(to_process_chemsys)
+
+        self.logger.info(
+            f"Found {self.total} chemical systems with new/updated materials to process"
+        )
 
         return [
             to_process_chemsys[i : i + self.chunk_size]
-            for i in range(0, len(to_process_chemsys), self.chunk_size)
+            for i in range(0, self.total, self.chunk_size)
         ]
-
-        # Yield the chemical systems in order of increasing size
-        # Will build them in a similar manner to fast Pourbaix
-
-    #        for chemsys in sorted(
-    #            to_process_chemsys, key=lambda x: len(x.split("-")), reverse=False
-    #        ):
-    #            corrected_entries = self.corrected_entries.query_one({"chemsys": chemsys})
-    #            yield corrected_entries
 
     def get_processed_docs(self, chemsys):
         # Yield the chemical systems in order of increasing size
         # Will build them in a similar manner to fast Pourbaix
+        self.corrected_entries.connect()
+
+        all_docs = []
+
         for sys in sorted(chemsys, key=lambda x: len(x.split("-")), reverse=False):
             corrected_entries = self.corrected_entries.query_one({"chemsys": chemsys})
 
-        return corrected_entries
+            all_docs.append(corrected_entries)
+
+        self.corrected_entries.close()
+
+        return all_docs
 
     def process_item(self, item):
         if not item:
@@ -311,4 +311,3 @@ class ThermoBuilder(Builder):
         ]
 
         return to_process_chemsys
-
