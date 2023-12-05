@@ -1,8 +1,9 @@
 from typing import Dict, Optional
-from maggma.builders.map_builder import MapBuilder
-from maggma.core import Store
 
+from maggma.builders.dag_map_builder import MapBuilder
+from maggma.core import Store
 from pymatgen.core.structure import Structure
+
 from emmet.core.robocrys import RobocrystallogapherDoc
 from emmet.core.utils import jsanitize
 
@@ -10,22 +11,31 @@ from emmet.core.utils import jsanitize
 class RobocrystallographerBuilder(MapBuilder):
     def __init__(
         self,
-        oxidation_states: Store,
-        robocrys: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         query: Optional[Dict] = None,
+        chunk_size: int = 300,
+        allow_bson=True,
         **kwargs
     ):
-        self.oxidation_states = oxidation_states
-        self.robocrys = robocrys
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.oxidation_states = source_keys["oxidation_states"]
+        self.robocrys = target_keys["robocrys"]
+        self.query = query or {}
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.kwargs = kwargs
 
         self.robocrys.key = "material_id"
         self.oxidation_states.key = "material_id"
 
         super().__init__(
-            source=oxidation_states,
-            target=robocrys,
-            query=query,
+            source=self.oxidation_states,
+            target=self.robocrys,
+            query=self.query,
+            chunk_size=self.chunk_size,
             projection=["material_id", "structure", "deprecated"],
             **kwargs
         )
@@ -42,4 +52,4 @@ class RobocrystallographerBuilder(MapBuilder):
             fields=[],
         )
 
-        return jsanitize(doc.model_dump(), allow_bson=True)
+        return jsanitize(doc.model_dump(), allow_bson=self.allow_bson)
