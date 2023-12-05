@@ -1,18 +1,21 @@
-from maggma.builders.map_builder import MapBuilder
-from maggma.stores import MongoStore
-from typing import Tuple
-from emmet.core.mobility.migrationgraph import MigrationGraphDoc
-from emmet.builders.utils import get_hop_cutoff
-from pymatgen.apps.battery.insertion_battery import InsertionElectrode
+from typing import Dict, Tuple
+
+from maggma.builders.dag_map_builder import MapBuilder
+from maggma.core import Store
 from pymatgen.analysis.diffusion.neb.full_path_mapper import MigrationGraph
+from pymatgen.apps.battery.insertion_battery import InsertionElectrode
+
+from emmet.builders.utils import get_hop_cutoff
+from emmet.core.mobility.migrationgraph import MigrationGraphDoc
 from emmet.core.utils import jsanitize
 
 
 class MigrationGraphBuilder(MapBuilder):
     def __init__(
         self,
-        insertion_electrode: MongoStore,
-        migration_graph: MongoStore,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 300,
         algorithm: str = "hops_based",
         min_hop_distance: float = 1,
         max_hop_distance: float = 7,
@@ -24,8 +27,13 @@ class MigrationGraphBuilder(MapBuilder):
         angle_tol: float = 5,
         **kwargs,
     ):
-        self.insertion_electrode = insertion_electrode
-        self.migration_graph = migration_graph
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.insertion_electrode = source_keys["insertion_electrodes"]
+        self.migration_graph = target_keys["migration_graph"]
+        self.chunk_size = chunk_size
+
         self.algorithm = algorithm
         self.min_hop_distance = min_hop_distance
         self.max_hop_distance = max_hop_distance
@@ -35,8 +43,13 @@ class MigrationGraphBuilder(MapBuilder):
         self.ltol = ltol
         self.stol = stol
         self.angle_tol = angle_tol
-        super().__init__(source=insertion_electrode, target=migration_graph, **kwargs)
-        self.connect()
+
+        super().__init__(
+            source=self.insertion_electrode,
+            target=self.migration_graph,
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
 
     def unary_function(self, item):
         warnings = []
