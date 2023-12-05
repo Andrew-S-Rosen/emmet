@@ -1,4 +1,6 @@
-from maggma.builders.map_builder import MapBuilder
+from typing import Dict
+
+from maggma.builders.dag_map_builder import MapBuilder
 from maggma.core import Store
 from pymatgen.core import Structure
 
@@ -9,9 +11,11 @@ from emmet.core.utils import jsanitize
 class OxidationStatesBuilder(MapBuilder):
     def __init__(
         self,
-        materials: Store,
-        oxidation_states: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         query=None,
+        chunk_size: int = 300,
+        allow_bson=True,
         **kwargs,
     ):
         """
@@ -22,17 +26,23 @@ class OxidationStatesBuilder(MapBuilder):
             oxidation_states: Store to update with oxidation state document
             query : query on materials to limit search
         """
-        self.materials = materials
-        self.oxidation_states = oxidation_states
-        self.kwargs = kwargs
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.materials = source_keys["materials"]
+        self.oxidation_states = target_keys["oxidation_states"]
         self.query = query or {}
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
+        self.kwargs = kwargs
 
         # Enforce that we key on material_id
         self.materials.key = "material_id"
         self.oxidation_states.key = "material_id"
         super().__init__(
-            source=materials,
-            target=oxidation_states,
+            source=self.materials,
+            target=self.oxidation_states,
+            chunk_size=chunk_size,
             projection=["structure", "deprecated"],
             query=query,
             **kwargs,
@@ -46,6 +56,6 @@ class OxidationStatesBuilder(MapBuilder):
         oxi_doc = OxidationStateDoc.from_structure(
             structure=structure, material_id=mpid, deprecated=deprecated
         )
-        doc = jsanitize(oxi_doc.model_dump(), allow_bson=True)
+        doc = jsanitize(oxi_doc.model_dump(), allow_bson=self.allow_bson)
 
         return doc
