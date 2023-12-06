@@ -1,31 +1,31 @@
+import copy
 import warnings
 from collections import defaultdict
-from itertools import chain
-from typing import Dict, Iterable, Iterator, List, Optional
-from math import ceil
-import copy
 from datetime import datetime
+from itertools import chain
+from math import ceil
+from typing import Dict, Iterable, Iterator, List, Optional
 
 from maggma.core import Builder, Store
 from maggma.utils import grouper
-from pymatgen.entries.computed_entries import ComputedStructureEntry
 from pymatgen.entries.compatibility import Compatibility
+from pymatgen.entries.computed_entries import ComputedStructureEntry
 
-from emmet.core.utils import jsanitize
-from emmet.builders.utils import chemsys_permutations, HiddenPrints
-from emmet.core.thermo import ThermoType
+from emmet.builders.utils import HiddenPrints, chemsys_permutations
 from emmet.core.corrected_entries import CorrectedEntriesDoc
+from emmet.core.thermo import ThermoType
+from emmet.core.utils import jsanitize
 
 
 class CorrectedEntriesBuilder(Builder):
     def __init__(
         self,
-        materials: Store,
-        corrected_entries: Store,
-        oxidation_states: Optional[Store] = None,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         query: Optional[Dict] = None,
         compatibility: Optional[List[Compatibility]] = None,
         chunk_size: int = 1000,
+        allow_bson=True,
         **kwargs,
     ):
         """
@@ -41,13 +41,21 @@ class CorrectedEntriesBuilder(Builder):
                 to ensure energies are compatible
             chunk_size (int): Size of chemsys chunks to process at any one time.
         """
+        self.source_keys = source_keys
+        self.target_keys = target_keys
 
-        self.materials = materials
-        self.query = query if query else {}
-        self.corrected_entries = corrected_entries
+        self.materials = source_keys["materials"]
+        self.oxidation_states = (
+            source_keys["oxidation_states"]
+            if "oxidation_states" in source_keys
+            else None
+        )
+
+        self.corrected_entries = target_keys["corrected_entries"]
         self.compatibility = compatibility or [None]
-        self.oxidation_states = oxidation_states
+
         self.chunk_size = chunk_size
+        self.query = query if query else {}
         self._entries_cache: Dict[str, List[ComputedStructureEntry]] = defaultdict(list)
 
         if self.corrected_entries.key != "chemsys":
@@ -63,7 +71,7 @@ class CorrectedEntriesBuilder(Builder):
             )
             self.materials.key = "material_id"
 
-        sources = [materials]
+        sources = [self.materials]
 
         if self.oxidation_states is not None:
             if self.oxidation_states.key != "material_id":
@@ -72,12 +80,12 @@ class CorrectedEntriesBuilder(Builder):
                 )
                 self.oxidation_states.key = "material_id"
 
-            sources.append(oxidation_states)  # type: ignore
+            sources.append(self.oxidation_states)  # type: ignore
 
-        targets = [corrected_entries]
+        targets = [self.corrected_entries]
 
         super().__init__(
-            sources=sources, targets=targets, chunk_size=chunk_size, **kwargs
+            sources=sources, targets=targets, chunk_size=self.chunk_size, **kwargs
         )
 
     def ensure_indexes(self):
@@ -118,89 +126,108 @@ class CorrectedEntriesBuilder(Builder):
         )
         self.total = len(to_process_chemsys)
 
-        # Yield the chemical systems in order of increasing size
-        for chemsys in sorted(
-            to_process_chemsys, key=lambda x: len(x.split("-")), reverse=False
-        ):
-            entries = self.get_entries(chemsys)
-            yield entries
+        return [
+            to_process_chemsys[i : i + self.chunk_size]
+            for i in range(0, len(to_process_chemsys), self.chunk_size)
+        ]
 
-    def process_item(self, item):
+    def get_processed_docs(self, mats):
+        self.materials.connect()
+        if self.oxidation_states:
+            self.oxidation_states.connect()
+
+        all_docs = []
+
+        # Yield the chemical systems in order of increasing size
+        for chemsys in sorted(mats, key=lambda x: len(x.split("-")), reverse=False):
+            entries = self.get_entries(chemsys)
+            all_docs.append(entries)
+
+        return all_docs
+
+    def process_item(self, items):
         """
         Applies correction schemes to entries and constructs CorrectedEntriesDoc objects
         """
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-        if not item:
-            return None
+            entries = [ComputedStructureEntry.from_dict(entry) for entry in item]
+            # determine chemsys
+            elements = sorted(
+                set([el.symbol for e in entries for el in e.composition.elements])
+            )
+            chemsys = "-".join(elements)
 
-        entries = [ComputedStructureEntry.from_dict(entry) for entry in item]
-        # determine chemsys
-        elements = sorted(
-            set([el.symbol for e in entries for el in e.composition.elements])
-        )
-        chemsys = "-".join(elements)
+            self.logger.debug(f"Processing {len(entries)} entries for {chemsys}")
 
-        self.logger.debug(f"Processing {len(entries)} entries for {chemsys}")
+            all_entry_types = {str(e.data["run_type"]) for e in entries}
 
-        all_entry_types = {str(e.data["run_type"]) for e in entries}
+            corrected_entries = {}
 
-        corrected_entries = {}
+            for compatibility in self.compatibility:
+                if compatibility is not None:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        with HiddenPrints():
+                            if compatibility.name == "MP DFT mixing scheme":
+                                thermo_type = ThermoType.GGA_GGA_U_R2SCAN
 
-        for compatibility in self.compatibility:
-            if compatibility is not None:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    with HiddenPrints():
-                        if compatibility.name == "MP DFT mixing scheme":
-                            thermo_type = ThermoType.GGA_GGA_U_R2SCAN
+                                if "R2SCAN" in all_entry_types:
+                                    only_scan_pd_entries = [
+                                        e
+                                        for e in entries
+                                        if str(e.data["run_type"]) == "R2SCAN"
+                                    ]
+                                    corrected_entries["R2SCAN"] = only_scan_pd_entries
 
-                            if "R2SCAN" in all_entry_types:
-                                only_scan_pd_entries = [
-                                    e
-                                    for e in entries
-                                    if str(e.data["run_type"]) == "R2SCAN"
-                                ]
-                                corrected_entries["R2SCAN"] = only_scan_pd_entries
+                                    pd_entries = compatibility.process_entries(
+                                        copy.deepcopy(entries)
+                                    )
 
+                                else:
+                                    corrected_entries["R2SCAN"] = None
+                                    pd_entries = None
+
+                            elif compatibility.name == "MP2020":
+                                thermo_type = ThermoType.GGA_GGA_U
+                                pd_entries = compatibility.process_entries(
+                                    copy.deepcopy(entries)
+                                )
+                            else:
+                                thermo_type = ThermoType.UNKNOWN
                                 pd_entries = compatibility.process_entries(
                                     copy.deepcopy(entries)
                                 )
 
-                            else:
-                                corrected_entries["R2SCAN"] = None
-                                pd_entries = None
+                            corrected_entries[str(thermo_type)] = pd_entries
 
-                        elif compatibility.name == "MP2020":
-                            thermo_type = ThermoType.GGA_GGA_U
-                            pd_entries = compatibility.process_entries(
-                                copy.deepcopy(entries)
-                            )
-                        else:
-                            thermo_type = ThermoType.UNKNOWN
-                            pd_entries = compatibility.process_entries(
-                                copy.deepcopy(entries)
-                            )
-
-                        corrected_entries[str(thermo_type)] = pd_entries
-
-            else:
-                if len(all_entry_types) > 1:
-                    raise ValueError(
-                        "More than one functional type has been provided without a mixing scheme!"
-                    )
                 else:
-                    thermo_type = all_entry_types.pop()
+                    if len(all_entry_types) > 1:
+                        raise ValueError(
+                            "More than one functional type has been provided without a mixing scheme!"
+                        )
+                    else:
+                        thermo_type = all_entry_types.pop()
 
-                corrected_entries[str(thermo_type)] = copy.deepcopy(entries)
+                    corrected_entries[str(thermo_type)] = copy.deepcopy(entries)
 
-        doc = CorrectedEntriesDoc(chemsys=chemsys, entries=corrected_entries)
+            doc = CorrectedEntriesDoc(chemsys=chemsys, entries=corrected_entries)
 
-        return jsanitize(doc.model_dump(), allow_bson=True)
+            docs.append(jsanitize(doc.model_dump(), allow_bson=self.allow_bson))
+
+        return docs
 
     def update_targets(self, items):
         """
         Inserts the new corrected entry docs into the corrected entries collection
         """
+        if not items:
+            return
+
+        self.corrected_entries.connect()
 
         docs = list(filter(None, items))
 
@@ -209,6 +236,8 @@ class CorrectedEntriesBuilder(Builder):
             self.corrected_entries.update(docs=docs, key=["chemsys"])
         else:
             self.logger.info("No corrected entry items to update")
+
+        self.corrected_entries.close()
 
     def get_entries(self, chemsys: str) -> List[Dict]:
         """
