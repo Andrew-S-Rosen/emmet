@@ -1,7 +1,7 @@
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Tuple
-from math import ceil
 from datetime import datetime
+from math import ceil
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from maggma.core import Builder, Store
 from maggma.utils import grouper
@@ -16,10 +16,11 @@ from emmet.core.utils import get_sg, jsanitize
 class ProvenanceBuilder(Builder):
     def __init__(
         self,
-        materials: Store,
-        provenance: Store,
-        source_snls: List[Store],
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         settings: Optional[EmmetBuildSettings] = None,
+        chunk_size: int = 200,
+        allow_bson=True,
         query: Optional[Dict] = None,
         **kwargs,
     ):
@@ -32,20 +33,28 @@ class ProvenanceBuilder(Builder):
             source_snls: List of locations to grab SNLs
             query : query on materials to limit search
         """
-        self.materials = materials
-        self.provenance = provenance
-        self.source_snls = source_snls
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.materials = source_keys.pop("materials")
+        self.source_snls = source_keys
+        self.provenance = target_keys["provenance"]
         self.settings = EmmetBuildSettings.autoload(settings)
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query or {}
         self.kwargs = kwargs
 
-        materials.key = "material_id"
-        provenance.key = "material_id"
-        for s in source_snls:
+        self.materials.key = "material_id"
+        self.provenance.key = "material_id"
+        for s in self.source_snls:
             s.key = "snl_id"
 
         super().__init__(
-            sources=[materials, *source_snls], targets=[provenance], **kwargs
+            sources=[self.materials, *[val for key, val in self.source_snls.items()]],
+            targets=[self.provenance],
+            chunk_size=self.chunk_size,
+            **kwargs,
         )
 
     def ensure_indicies(self):
@@ -145,7 +154,20 @@ class ProvenanceBuilder(Builder):
 
         self.logger.info(f"Found {self.total} new/updated systems to process")
 
-        for mat_id in mat_ids:
+        return [
+            mat_ids[i : i + self.chunk_size]
+            for i in range(0, len(mat_ids), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        self.materials.connect()
+
+        for store in self.source_snls:
+            self.source_snls[store].connect()
+
+        all_docs = []
+
+        for mat_id in mats:
             mat = self.materials.query_one(
                 properties=[
                     "material_id",
@@ -176,47 +198,59 @@ class ProvenanceBuilder(Builder):
             snl_structs = snl_groups[mat_sg]
 
             self.logger.debug(f"Found {len(snl_structs)} potential snls for {mat_id}")
-            yield mat, snl_structs
 
-    def process_item(self, item) -> Dict:
+            all_docs.append((mat, snl_structs))
+
+        return all_docs
+
+    def process_item(self, items) -> Dict:
         """
         Matches SNLS and Materials
         Args:
-            item (tuple): a tuple of materials and snls
+            items (list[tuple]): a list of tuples of materials and snls
         Returns:
             list(dict): a list of collected snls with material ids
         """
-        mat, snl_structs = item
-        formula_pretty = mat["formula_pretty"]
-        snl_doc = None
-        self.logger.debug(f"Finding Provenance {formula_pretty}")
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-        # Match up SNLS with materials
+            mat, snl_structs = item
+            formula_pretty = mat["formula_pretty"]
+            snl_doc = None
+            self.logger.debug(f"Finding Provenance {formula_pretty}")
 
-        matched_snls = self.match(snl_structs, mat)
+            # Match up SNLS with materials
 
-        if len(matched_snls) > 0:
-            doc = ProvenanceDoc.from_SNLs(
-                material_id=mat["material_id"],
-                structure=Structure.from_dict(mat["structure"]),
-                snls=matched_snls,
-                deprecated=mat["deprecated"],
+            matched_snls = self.match(snl_structs, mat)
+
+            if len(matched_snls) > 0:
+                doc = ProvenanceDoc.from_SNLs(
+                    material_id=mat["material_id"],
+                    structure=Structure.from_dict(mat["structure"]),
+                    snls=matched_snls,
+                    deprecated=mat["deprecated"],
+                )
+            else:
+                doc = ProvenanceDoc(
+                    material_id=mat["material_id"],
+                    structure=Structure.from_dict(mat["structure"]),
+                    deprecated=mat["deprecated"],
+                    created_at=datetime.utcnow(),
+                )
+
+            doc.authors.append(self.settings.DEFAULT_AUTHOR)
+            doc.history.append(self.settings.DEFAULT_HISTORY)
+            doc.references.append(self.settings.DEFAULT_REFERENCE)
+
+            snl_doc = jsanitize(
+                doc.dict(exclude_none=False), allow_bson=self.allow_bson
             )
-        else:
-            doc = ProvenanceDoc(
-                material_id=mat["material_id"],
-                structure=Structure.from_dict(mat["structure"]),
-                deprecated=mat["deprecated"],
-                created_at=datetime.utcnow(),
-            )
 
-        doc.authors.append(self.settings.DEFAULT_AUTHOR)
-        doc.history.append(self.settings.DEFAULT_HISTORY)
-        doc.references.append(self.settings.DEFAULT_REFERENCE)
+            docs.append(snl_doc)
 
-        snl_doc = jsanitize(doc.dict(exclude_none=False), allow_bson=True)
-
-        return snl_doc
+        return docs
 
     def match(self, snl_structs, mat):
         """
@@ -258,6 +292,11 @@ class ProvenanceBuilder(Builder):
         """
         Inserts the new SNL docs into the SNL collection
         """
+        if not items:
+            return
+
+        self.provenance.connect()
+
         snls = list(filter(None, items))
 
         if len(snls) > 0:
@@ -265,3 +304,5 @@ class ProvenanceBuilder(Builder):
             self.provenance.update(snls)
         else:
             self.logger.info("No items to update")
+
+        self.provenance.close()
