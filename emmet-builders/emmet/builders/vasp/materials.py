@@ -41,9 +41,10 @@ class MaterialsBuilder(Builder):
 
     def __init__(
         self,
-        tasks: Store,
-        materials: Store,
-        task_validation: Optional[Store] = None,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 200,
+        allow_bson=True,
         query: Optional[Dict] = None,
         settings: Optional[EmmetBuildSettings] = None,
         **kwargs,
@@ -56,18 +57,29 @@ class MaterialsBuilder(Builder):
             query: dictionary to limit tasks to be analyzed
             settings: EmmetSettings to use in the build process
         """
+        self.source_keys = source_keys
+        self.target_keys = target_keys
 
-        self.tasks = tasks
-        self.materials = materials
-        self.task_validation = task_validation
+        self.tasks = source_keys["tasks"]
+        self.task_validation = (
+            source_keys["task_validation"] if "task_validation" in source_keys else None
+        )
+        self.materials = target_keys["materials"]
         self.query = query if query else {}
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
 
-        sources = [tasks]
+        sources = [self.tasks]
+
         if self.task_validation:
             sources.append(self.task_validation)
-        super().__init__(sources=sources, targets=[materials], **kwargs)
+
+        super().__init__(
+            sources=sources,
+            targets=[self.materials],
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
 
     def ensure_indexes(self):
         """
@@ -91,19 +103,19 @@ class MaterialsBuilder(Builder):
 
     def prechunk(self, number_splits: int) -> Iterable[Dict]:  # pragma: no cover
         """Prechunk the materials builder for distributed computation"""
-        temp_query = dict(self.query)
-        temp_query["state"] = "successful"
+        self.temp_query = dict(self.query)
+        self.temp_query["state"] = "successful"
         if len(self.settings.BUILD_TAGS) > 0 and len(self.settings.EXCLUDED_TAGS) > 0:
-            temp_query["$and"] = [
+            self.temp_query["$and"] = [
                 {"tags": {"$in": self.settings.BUILD_TAGS}},
                 {"tags": {"$nin": self.settings.EXCLUDED_TAGS}},
             ]
         elif len(self.settings.BUILD_TAGS) > 0:
-            temp_query["tags"] = {"$in": self.settings.BUILD_TAGS}
+            self.temp_query["tags"] = {"$in": self.settings.BUILD_TAGS}
 
         self.logger.info("Finding tasks to process")
         all_tasks = list(
-            self.tasks.query(temp_query, [self.tasks.key, "formula_pretty"])
+            self.tasks.query(self.temp_query, [self.tasks.key, "formula_pretty"])
         )
 
         processed_tasks = set(self.materials.distinct("task_ids"))
@@ -141,19 +153,19 @@ class MaterialsBuilder(Builder):
         self.timestamp = datetime.utcnow()
 
         # Get all processed tasks:
-        temp_query = dict(self.query)
-        temp_query["state"] = "successful"
+        self.temp_query = dict(self.query)
+        self.temp_query["state"] = "successful"
         if len(self.settings.BUILD_TAGS) > 0 and len(self.settings.EXCLUDED_TAGS) > 0:
-            temp_query["$and"] = [
+            self.temp_query["$and"] = [
                 {"tags": {"$in": self.settings.BUILD_TAGS}},
                 {"tags": {"$nin": self.settings.EXCLUDED_TAGS}},
             ]
         elif len(self.settings.BUILD_TAGS) > 0:
-            temp_query["tags"] = {"$in": self.settings.BUILD_TAGS}
+            self.temp_query["tags"] = {"$in": self.settings.BUILD_TAGS}
 
         self.logger.info("Finding tasks to process")
         all_tasks = list(
-            self.tasks.query(temp_query, [self.tasks.key, "formula_pretty"])
+            self.tasks.query(self.temp_query, [self.tasks.key, "formula_pretty"])
         )
 
         processed_tasks = set(self.materials.distinct("task_ids"))
@@ -169,6 +181,15 @@ class MaterialsBuilder(Builder):
 
         # Set total for builder bars to have a total
         self.total = len(to_process_forms)
+
+        return [
+            to_process_forms[i : i + self.chunk_size]
+            for i in range(0, len(to_process_forms), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        for store in self.source_keys:
+            self.source_keys[store].connect()
 
         if self.task_validation:
             invalid_ids = {
@@ -204,8 +225,10 @@ class MaterialsBuilder(Builder):
             "tags",
         ]
 
-        for formula in to_process_forms:
-            tasks_query = dict(temp_query)
+        all_docs = []
+
+        for formula in mats:
+            tasks_query = dict(self.temp_query)
             tasks_query["formula_pretty"] = formula
             tasks = list(
                 self.tasks.query(criteria=tasks_query, properties=projected_fields)
@@ -213,53 +236,63 @@ class MaterialsBuilder(Builder):
             for t in tasks:
                 t["is_valid"] = t[self.tasks.key] not in invalid_ids
 
-            yield tasks
+            all_docs.append(tasks)
 
-    def process_item(self, items: List[Dict]) -> List[Dict]:
+        return all_docs
+
+    def process_item(self, items: List[List[Dict]]) -> List[Dict]:
         """
         Process the tasks into a list of materials
 
         Args:
-            tasks [dict]: a list of task docs
+            tasks [dict]: a list of lists containing task docs
 
         Returns:
             ([dict],list): a list of new materials docs and a list of task_ids that
                 were processed
         """
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-        tasks = [TaskDocument(**task) for task in items]
-        formula = tasks[0].formula_pretty
-        task_ids = [task.task_id for task in tasks]
+            tasks = [TaskDocument(**task) for task in item]
+            formula = tasks[0].formula_pretty
+            task_ids = [task.task_id for task in tasks]
 
-        # not all tasks contains transformation information
-        task_transformations = [task.get("transformations", None) for task in items]
+            # not all tasks contains transformation information
+            task_transformations = [task.get("transformations", None) for task in item]
 
-        self.logger.debug(f"Processing {formula}: {task_ids}")
+            self.logger.debug(f"Processing {formula}: {task_ids}")
 
-        grouped_tasks = self.filter_and_group_tasks(tasks, task_transformations)
-        materials = []
-        for group in grouped_tasks:
-            try:
-                materials.append(
-                    MaterialsDoc.from_tasks(
-                        group,
-                        structure_quality_scores=self.settings.VASP_STRUCTURE_QUALITY_SCORES,
-                        use_statics=self.settings.VASP_USE_STATICS,
+            grouped_tasks = self.filter_and_group_tasks(tasks, task_transformations)
+            materials = []
+            for group in grouped_tasks:
+                try:
+                    materials.append(
+                        MaterialsDoc.from_tasks(
+                            group,
+                            structure_quality_scores=self.settings.VASP_STRUCTURE_QUALITY_SCORES,
+                            use_statics=self.settings.VASP_USE_STATICS,
+                        )
                     )
-                )
-            except Exception as e:
-                failed_ids = list({t_.task_id for t_ in group})
-                doc = MaterialsDoc.construct_deprecated_material(group)
-                doc.warnings.append(str(e))
-                materials.append(doc)
-                self.logger.warn(
-                    f"Failed making material for {failed_ids}."
-                    f" Inserted as deprecated Material: {doc.material_id}"
-                )
+                except Exception as e:
+                    failed_ids = list({t_.task_id for t_ in group})
+                    doc = MaterialsDoc.construct_deprecated_material(group)
+                    doc.warnings.append(str(e))
+                    materials.append(doc)
+                    self.logger.warn(
+                        f"Failed making material for {failed_ids}."
+                        f" Inserted as deprecated Material: {doc.material_id}"
+                    )
 
-        self.logger.debug(f"Produced {len(materials)} materials for {formula}")
+            self.logger.debug(f"Produced {len(materials)} materials for {formula}")
 
-        return jsanitize([mat.model_dump() for mat in materials], allow_bson=True)
+            docs.append(
+                jsanitize([mat.model_dump() for mat in materials], allow_bson=True)
+            )
+
+        return docs
 
     def update_targets(self, items: List[List[Dict]]):
         """
@@ -269,20 +302,27 @@ class MaterialsBuilder(Builder):
             items ([([dict],[int])]): A list of tuples of materials to update and the
                 corresponding processed task_ids
         """
+        if not items:
+            return
 
-        docs = list(chain.from_iterable(items))  # type: ignore
+        self.materials.connect()
 
-        for item in docs:
-            item.update({"_bt": self.timestamp})
+        for item in items:
+            docs = list(chain.from_iterable(item))  # type: ignore
 
-        material_ids = list({item["material_id"] for item in docs})
+            for doc in docs:
+                doc.update({"_bt": self.timestamp})
 
-        if len(items) > 0:
-            self.logger.info(f"Updating {len(docs)} materials")
-            self.materials.remove_docs({self.materials.key: {"$in": material_ids}})
-            self.materials.update(docs=docs, key=["material_id"])
-        else:
-            self.logger.info("No items to update")
+            material_ids = list({doc["material_id"] for doc in docs})
+
+            if len(item) > 0:
+                self.logger.info(f"Updating {len(docs)} materials")
+                self.materials.remove_docs({self.materials.key: {"$in": material_ids}})
+                self.materials.update(docs=docs, key=["material_id"])
+            else:
+                self.logger.info("No items to update")
+
+        self.materials.close()
 
     def filter_and_group_tasks(
         self, tasks: List[TaskDocument], task_transformations: List[Union[Dict, None]]
