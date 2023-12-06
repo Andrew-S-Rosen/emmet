@@ -1,92 +1,81 @@
 from math import ceil
+from typing import Dict
 
 from maggma.builders import Builder
+from maggma.core import Store
 from maggma.utils import grouper
 
 from emmet.core.mpid import MPID
-from emmet.core.summary import SummaryDoc, HasProps
-from emmet.core.utils import jsanitize
+from emmet.core.summary import HasProps, SummaryDoc
 from emmet.core.thermo import ThermoType
+from emmet.core.utils import jsanitize
 
 
 class SummaryBuilder(Builder):
     def __init__(
         self,
-        materials,
-        thermo,
-        xas,
-        chemenv,
-        absorption,
-        grain_boundaries,
-        electronic_structure,
-        magnetism,
-        elasticity,
-        dielectric,
-        piezoelectric,
-        phonon,
-        insertion_electrodes,
-        substrates,
-        surfaces,
-        oxi_states,
-        eos,
-        provenance,
-        charge_density_index,
-        summary,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         thermo_type=ThermoType.GGA_GGA_U_R2SCAN.value,
         chunk_size=100,
+        allow_bson=True,
         query=None,
         **kwargs,
     ):
-        self.materials = materials
-        self.thermo = thermo
-        self.xas = xas
-        self.chemenv = chemenv
-        self.absorption = absorption
-        self.grain_boundaries = grain_boundaries
-        self.electronic_structure = electronic_structure
-        self.magnetism = magnetism
-        self.elasticity = elasticity
-        self.dielectric = dielectric
-        self.piezoelectric = piezoelectric
-        self.phonon = phonon
-        self.insertion_electrodes = insertion_electrodes
-        self.substrates = substrates
-        self.surfaces = surfaces
-        self.oxi_states = oxi_states
-        self.eos = eos
-        self.provenance = provenance
-        self.charge_density_index = charge_density_index
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.absorption = source_keys["absorption"]
+        self.charge_density_index = source_keys["charge_density_index"]
+        self.chemenv = source_keys["chemenv"]
+        self.dielectric = source_keys["dielectric"]
+        self.elasticity = source_keys["elasticity"]
+        self.electronic_structure = source_keys["electronic_structure"]
+        self.eos = source_keys["eos"]
+        self.grain_boundaries = source_keys["grain_boundaries"]
+        self.insertion_electrodes = source_keys["insertion_electrodes"]
+        self.magnetism = source_keys["magnetism"]
+        self.materials = source_keys["materials"]
+        self.oxi_states = source_keys["oxi_states"]
+        self.phonon = source_keys["phonon"]
+        self.piezoelectric = source_keys["piezoelectric"]
+        self.provenance = source_keys["provenance"]
+        self.substrates = source_keys["substrates"]
+        self.surface_properties = source_keys["surfaces"]
+        self.thermo = source_keys["thermo"]
+        self.xas = source_keys["xas"]
 
         self.thermo_type = thermo_type
 
-        self.summary = summary
+        self.summary = target_keys["summary"]
         self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else {}
 
         super().__init__(
             sources=[
-                materials,
-                thermo,
-                xas,
-                chemenv,
-                absorption,
-                grain_boundaries,
-                electronic_structure,
-                magnetism,
-                elasticity,
-                dielectric,
-                piezoelectric,
-                phonon,
-                insertion_electrodes,
-                surfaces,
-                oxi_states,
-                substrates,
-                eos,
-                provenance,
-                charge_density_index,
+                self.materials,
+                self.thermo,
+                self.xas,
+                self.chemenv,
+                self.absorption,
+                self.grain_boundaries,
+                self.electronic_structure,
+                self.magnetism,
+                self.elasticity,
+                self.dielectric,
+                self.piezoelectric,
+                self.phonon,
+                self.insertion_electrodes,
+                self.surface_properties,
+                self.oxi_states,
+                self.substrates,
+                self.eos,
+                self.provenance,
+                self.charge_density_index,
             ],
-            targets=[summary],
-            chunk_size=chunk_size,
+            targets=[self.summary],
+            chunk_size=self.chunk_size,
             **kwargs,
         )
 
@@ -109,9 +98,20 @@ class SummaryBuilder(Builder):
 
         self.total = len(summary_set)
 
-        self.logger.debug("Processing {} materials.".format(self.total))
+        self.logger.debug(f"Processing {self.total} materials.")
 
-        for entry in summary_set:
+        return [
+            summary_set[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        for store in self.source_keys:
+            self.source_keys[store].connect()
+
+        all_docs = []
+
+        for entry in mats:
             materials_doc = self.materials.query_one({self.materials.key: entry})
 
             valid_static_tasks = set(
@@ -160,8 +160,8 @@ class SummaryBuilder(Builder):
                         [self.insertion_electrodes.key],
                     )
                 ),
-                HasProps.surface_properties.value: self.surfaces.query_one(
-                    {self.surfaces.key: {"$in": all_tasks}}
+                HasProps.surface_properties.value: self.surface_properties.query_one(
+                    {self.surface_properties.key: {"$in": all_tasks}}
                 ),
                 HasProps.substrates.value: list(
                     self.substrates.query(
@@ -199,7 +199,9 @@ class SummaryBuilder(Builder):
                         else None
                     )
 
-            yield data
+            all_docs.append(data)
+
+        return all_docs
 
     def prechunk(self, number_splits: int):  # pragma: no cover
         """
@@ -213,10 +215,21 @@ class SummaryBuilder(Builder):
         for split in grouper(keys, N):
             yield {"query": {self.materials.key: {"$in": list(split)}}}
 
-    def process_item(self, item):
-        material_id = MPID(item[HasProps.materials.value]["material_id"])
-        doc = SummaryDoc.from_docs(material_id=material_id, **item)
-        return jsanitize(doc.model_dump(exclude_none=False), allow_bson=True)
+    def process_item(self, items):
+        docs = []
+        for item in items:
+            if not item:
+                continue
+
+            material_id = MPID(item[HasProps.materials.value]["material_id"])
+            doc = SummaryDoc.from_docs(material_id=material_id, **item)
+            docs.append(
+                jsanitize(
+                    doc.model_dump(exclude_none=False), allow_bson=self.allow_bson
+                )
+            )
+
+        return docs
 
     def update_targets(self, items):
         """
@@ -225,6 +238,11 @@ class SummaryBuilder(Builder):
         Args:
             items ([dict]): A list of dictionaries of mpid document pairs to update
         """
+        if not items:
+            return
+
+        self.summary.connect()
+
         items = list(filter(None, items))
 
         if len(items) > 0:
@@ -232,3 +250,5 @@ class SummaryBuilder(Builder):
             self.summary.update(docs=items)
         else:
             self.logger.info("No summary entries to update")
+
+        self.summary.close()
