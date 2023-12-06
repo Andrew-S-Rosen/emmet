@@ -20,12 +20,9 @@ class ThermoBuilder(Builder):
         self,
         source_keys: Dict[str, Store],
         target_keys: Dict[str, Store],
-        # thermo: Store,
-        # corrected_entries: Store,
-        # phase_diagram: Optional[Store] = None,
         query: Optional[Dict] = None,
         num_phase_diagram_eles: Optional[int] = None,
-        chunk_size: int = 1000,
+        chunk_size: int = 200,
         **kwargs,
     ):
         """
@@ -84,7 +81,7 @@ class ThermoBuilder(Builder):
             targets.append(self.phase_diagram)  # type: ignore
 
         super().__init__(
-            sources=sources, targets=targets, chunk_size=chunk_size, **kwargs
+            sources=sources, targets=targets, chunk_size=self.chunk_size, **kwargs
         )
 
     def ensure_indexes(self):
@@ -165,32 +162,36 @@ class ThermoBuilder(Builder):
 
         return all_docs
 
-    def process_item(self, item):
-        if not item:
-            return None
+    def process_item(self, items):
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-        pd_thermo_doc_pair_list = []
+            pd_thermo_doc_pair_list = []
 
-        for thermo_type, entry_list in item["entries"].items():
-            if entry_list:
-                entries = [
-                    ComputedStructureEntry.from_dict(entry) for entry in entry_list
-                ]
-                chemsys = item["chemsys"]
-                elements = chemsys.split("-")
+            for thermo_type, entry_list in item["entries"].items():
+                if entry_list:
+                    entries = [
+                        ComputedStructureEntry.from_dict(entry) for entry in entry_list
+                    ]
+                    chemsys = item["chemsys"]
+                    elements = chemsys.split("-")
 
-                self.logger.debug(
-                    f"Processing {len(entries)} entries for {chemsys} and thermo type {thermo_type}"
-                )
+                    self.logger.debug(
+                        f"Processing {len(entries)} entries for {chemsys} and thermo type {thermo_type}"
+                    )
 
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    with HiddenPrints():
-                        pd_thermo_doc_pair_list.append(
-                            self._produce_pair(entries, thermo_type, elements)
-                        )
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        with HiddenPrints():
+                            pd_thermo_doc_pair_list.append(
+                                self._produce_pair(entries, thermo_type, elements)
+                            )
 
-        return pd_thermo_doc_pair_list
+            docs.append(pd_thermo_doc_pair_list)
+
+        return docs
 
     def _produce_pair(self, pd_entries, thermo_type, elements):
         # Produce thermo and phase diagram pair
@@ -247,6 +248,11 @@ class ThermoBuilder(Builder):
         Args:
             items ([[tuple(List[dict],List[dict])]]): a list of a list of thermo and phase diagram dict pairs to update
         """
+        if not items:
+            return
+
+        self.thermo.connect()
+        self.phase_diagram.connect()
 
         thermo_docs = [pair[0] for pair_list in items for pair in pair_list]
         phase_diagram_docs = [pair[1] for pair_list in items for pair in pair_list]
@@ -276,6 +282,9 @@ class ThermoBuilder(Builder):
             self.thermo.update(docs=thermo_docs, key=["thermo_id"])
         else:
             self.logger.info("No thermo items to update")
+
+        self.thermo.close()
+        self.phase_diagram.close()
 
     def _get_chemsys_to_process(self):
         # Use last-updated to find new chemsys
