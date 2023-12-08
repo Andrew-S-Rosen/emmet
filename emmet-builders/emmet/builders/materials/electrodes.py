@@ -1,22 +1,23 @@
 import operator
+from collections import defaultdict
 from datetime import datetime
 from functools import lru_cache
 from itertools import chain
 from math import ceil
-from typing import Any, Iterator, Dict, List, Optional
-from collections import defaultdict
+from typing import Any, Dict, Iterator, List, Optional
 
 from maggma.builders import Builder
+from maggma.core import Store
 from maggma.stores import MongoStore
 from maggma.utils import grouper
-from pymatgen.entries.computed_entries import ComputedEntry, ComputedStructureEntry
+from pymatgen.analysis.phase_diagram import Composition, PhaseDiagram
 from pymatgen.entries.compatibility import MaterialsProject2020Compatibility
-from pymatgen.analysis.phase_diagram import PhaseDiagram, Composition
+from pymatgen.entries.computed_entries import ComputedEntry, ComputedStructureEntry
 
-from emmet.core.electrode import InsertionElectrodeDoc, ConversionElectrodeDoc
+from emmet.builders.settings import EmmetBuildSettings
+from emmet.core.electrode import ConversionElectrodeDoc, InsertionElectrodeDoc
 from emmet.core.structure_group import StructureGroupDoc, _get_id_num
 from emmet.core.utils import jsanitize
-from emmet.builders.settings import EmmetBuildSettings
 
 
 def s_hash(el):
@@ -82,8 +83,8 @@ default_build_settings = EmmetBuildSettings()
 class StructureGroupBuilder(Builder):
     def __init__(
         self,
-        materials: MongoStore,
-        sgroups: MongoStore,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         working_ion: str,
         query: Optional[dict] = None,
         ltol: float = default_build_settings.LTOL,
@@ -91,6 +92,7 @@ class StructureGroupBuilder(Builder):
         angle_tol: float = default_build_settings.ANGLE_TOL,
         check_newer: bool = True,
         chunk_size: int = 1000,
+        allow_bson=True,
         **kwargs,
     ):
         """
@@ -105,8 +107,11 @@ class StructureGroupBuilder(Builder):
                             the phase diagram is still constructed with the entire set
             chunk_size (int): Size of chemsys chunks to process at any one time.
         """
-        self.materials = materials
-        self.sgroups = sgroups
+        self.source_keys = source_keys
+        self.target_keys - target_keys
+
+        self.materials = source_keys["materials"]
+        self.sgroups = target_keys["insertion_electrodes_sgroups"]
         self.working_ion = working_ion
         self.query = query if query else {}
         self.ltol = ltol
@@ -114,13 +119,17 @@ class StructureGroupBuilder(Builder):
         self.angle_tol = angle_tol
         self.check_newer = check_newer
         self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
 
         self.query[
             "deprecated"
         ] = False  # Ensure only non-deprecated materials are chosen
 
         super().__init__(
-            sources=[materials], targets=[sgroups], chunk_size=chunk_size, **kwargs
+            sources=[self.materials],
+            targets=[self.sgroups],
+            chunk_size=self.chunk_size,
+            **kwargs,
         )
 
     def prechunk(self, number_splits: int) -> Iterator[Dict]:  # pragma: no cover
@@ -190,6 +199,17 @@ class StructureGroupBuilder(Builder):
         )
         self.total = len(all_chemsys)
 
+        return [
+            all_chemsys[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, all_chemsys):
+        self.materials.connect()
+        self.sgroups.connect()
+
+        all_docs = []
+
         for chemsys_l in all_chemsys:
             chemsys = "-".join(sorted(chemsys_l))
             chemsys_wo = "-".join(sorted(set(chemsys_l) - {self.working_ion}))
@@ -253,30 +273,69 @@ class StructureGroupBuilder(Builder):
                 )
                 if mat_ids == target_ids and max_mat_time < min_target_time:
                     self.logger.info(f"Skipping chemsys {chemsys}.")
-                    yield None
+                    continue
                 elif len(target_ids) == 0:
                     self.logger.info(
                         f"No documents in chemsys {chemsys} in the target database."
                     )
-                    yield {"chemsys": chemsys, "materials": all_mats_in_chemsys}
+                    all_docs.append(
+                        {"chemsys": chemsys, "materials": all_mats_in_chemsys}
+                    )
                 else:
                     self.logger.info(
                         f"Nuking all {len(target_ids)} documents in chemsys {chemsys} in the target database."
                     )
                     self._remove_targets(list(target_ids))
-                    yield {"chemsys": chemsys, "materials": all_mats_in_chemsys}
+                    all_docs.append(
+                        {"chemsys": chemsys, "materials": all_mats_in_chemsys}
+                    )
             else:
-                yield {"chemsys": chemsys, "materials": all_mats_in_chemsys}
+                all_docs.append({"chemsys": chemsys, "materials": all_mats_in_chemsys})
+
+        self.materials.close()
+        self.sgroups.close()
+
+        return all_docs
+
+    def process_item(self, items: Any) -> Any:
+        docs = []
+        for item in items:
+            if item is None:
+                continue
+
+            entries = [*map(self._entry_from_mat_doc, item["materials"])]
+            compatibility = MaterialsProject2020Compatibility()
+            processed_entries = compatibility.process_entries(entries=entries)
+            s_groups = StructureGroupDoc.from_ungrouped_structure_entries(
+                entries=processed_entries,
+                ignored_specie=self.working_ion,
+                ltol=self.ltol,
+                stol=self.stol,
+                angle_tol=self.angle_tol,
+            )
+            docs.append([sg.model_dump() for sg in s_groups])
+
+        return docs
 
     def update_targets(self, items: List):
-        items = list(filter(None, chain.from_iterable(items)))
-        if len(items) > 0:
-            self.logger.info("Updating {} sgroups documents".format(len(items)))
-            for struct_group_dict in items:
-                struct_group_dict[self.sgroups.last_updated_field] = datetime.utcnow()
-            self.sgroups.update(docs=items, key=["group_id"])
-        else:
-            self.logger.info("No items to update")
+        if not items:
+            return
+
+        self.sgroups.connect()
+
+        for item in items:
+            item = list(filter(None, chain.from_iterable(item)))
+            if len(item) > 0:
+                self.logger.info("Updating {} sgroups documents".format(len(item)))
+                for struct_group_dict in item:
+                    struct_group_dict[
+                        self.sgroups.last_updated_field
+                    ] = datetime.utcnow()
+                self.sgroups.update(docs=item, key=["group_id"])
+            else:
+                self.logger.info("No item to update")
+
+        self.sgroups.close()
 
     def _entry_from_mat_doc(self, mdoc):
         # Note since we are just structure grouping we don't need to be careful with energy or correction
@@ -293,21 +352,6 @@ class StructureGroupBuilder(Builder):
                 return ComputedStructureEntry.from_dict(mdoc["entries"]["GGA"])
             else:
                 return None
-
-    def process_item(self, item: Any) -> Any:
-        if item is None:
-            return None
-        entries = [*map(self._entry_from_mat_doc, item["materials"])]
-        compatibility = MaterialsProject2020Compatibility()
-        processed_entries = compatibility.process_entries(entries=entries)
-        s_groups = StructureGroupDoc.from_ungrouped_structure_entries(
-            entries=processed_entries,
-            ignored_specie=self.working_ion,
-            ltol=self.ltol,
-            stol=self.stol,
-            angle_tol=self.angle_tol,
-        )
-        return [sg.model_dump() for sg in s_groups]
 
     def _remove_targets(self, rm_ids):
         self.sgroups.remove_docs({"material_ids": {"$in": rm_ids}})
