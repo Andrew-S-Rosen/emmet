@@ -360,16 +360,22 @@ class StructureGroupBuilder(Builder):
 class InsertionElectrodeBuilder(Builder):
     def __init__(
         self,
-        grouped_materials: MongoStore,
-        thermo: MongoStore,
-        insertion_electrode: MongoStore,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 200,
+        allow_bson=True,
         query: Optional[Dict] = None,
         strip_structures: bool = False,
         **kwargs,
     ):
-        self.grouped_materials = grouped_materials
-        self.insertion_electrode = insertion_electrode
-        self.thermo = thermo
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.grouped_materials = source_keys["insertion_electrodes_sgroups"]
+        self.thermo = source_keys["thermo"]
+        self.insertion_electrode = target_keys["insertion_electrodes"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else {}
         self.strip_structures = strip_structures
 
@@ -396,6 +402,20 @@ class InsertionElectrodeBuilder(Builder):
         Get items
         """
 
+        q_ = {"$and": [self.query, {"has_distinct_compositions": True}]}
+
+        mats = list(self.grouped_materials.query(q_))
+
+        self.total = len(mats)
+
+        return [
+            mats[i : i + self.chunk_size] for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        self.grouped_materials.connect()
+        self.thermo.connect()
+
         @lru_cache(1000)
         def get_working_ion_entry(working_ion):
             with self.thermo as store:
@@ -407,7 +427,6 @@ class InsertionElectrodeBuilder(Builder):
             self.logger.debug(
                 f"Looking for {len(mat_ids)} material_id in the Thermo DB."
             )
-            self.thermo.connect()
             thermo_docs = list(
                 self.thermo.query(
                     {"$and": [{"material_id": {"$in": mat_ids}}]},
@@ -447,64 +466,83 @@ class InsertionElectrodeBuilder(Builder):
             #     "thermo_docs": thermo_docs,
             # }
 
-        q_ = {"$and": [self.query, {"has_distinct_compositions": True}]}
-        self.total = self.grouped_materials.count(q_)
-        for group_doc in self.grouped_materials.query(q_):
+        all_docs = []
+
+        for group_doc in mats:
             working_ion_doc = get_working_ion_entry(group_doc["ignored_specie"])
             thermo_docs = get_thermo_docs(group_doc["material_ids"])
             if thermo_docs:
-                yield {
-                    "group_id": group_doc["group_id"],
-                    "working_ion_doc": working_ion_doc,
-                    "working_ion": group_doc["ignored_specie"],
-                    "thermo_docs": thermo_docs,
-                }
+                all_docs.append(
+                    {
+                        "group_id": group_doc["group_id"],
+                        "working_ion_doc": working_ion_doc,
+                        "working_ion": group_doc["ignored_specie"],
+                        "thermo_docs": thermo_docs,
+                    }
+                )
             else:
-                yield None
+                continue
 
-    def process_item(self, item) -> Dict:
+        return all_docs
+
+    def process_item(self, items) -> Dict:
         """
         - Add volume information to each entry to create the insertion electrode document
         - Add the host structure
         """
-        if item is None:
-            return None  # type: ignore
-        self.logger.debug(
-            f"Working on {item['group_id']} with {len(item['thermo_docs'])}"
-        )
+        docs = []
 
-        entries = [
-            tdoc_["entries"][tdoc_["energy_type"]] for tdoc_ in item["thermo_docs"]
-        ]
+        for item in items:
+            if not item:
+                continue
 
-        entries = list(map(ComputedStructureEntry.from_dict, entries))
+            self.logger.debug(
+                f"Working on {item['group_id']} with {len(item['thermo_docs'])}"
+            )
 
-        working_ion_entry = ComputedEntry.from_dict(
-            item["working_ion_doc"]["entries"][item["working_ion_doc"]["energy_type"]]
-        )
-
-        decomp_energies = {
-            d_["material_id"]: d_["energy_above_hull"] for d_ in item["thermo_docs"]
-        }
-
-        for ient in entries:
-            ient.data["volume"] = ient.structure.volume
-            ient.data["decomposition_energy"] = decomp_energies[
-                ient.data["material_id"]
+            entries = [
+                tdoc_["entries"][tdoc_["energy_type"]] for tdoc_ in item["thermo_docs"]
             ]
 
-        ie = InsertionElectrodeDoc.from_entries(
-            grouped_entries=entries,
-            working_ion_entry=working_ion_entry,
-            battery_id=item["group_id"],
-            strip_structures=self.strip_structures,
-        )
-        if ie is None:
-            return None  # type: ignore
-            # {"failed_reason": "unable to create InsertionElectrode document"}
-        return jsanitize(ie.model_dump())
+            entries = list(map(ComputedStructureEntry.from_dict, entries))
+
+            working_ion_entry = ComputedEntry.from_dict(
+                item["working_ion_doc"]["entries"][
+                    item["working_ion_doc"]["energy_type"]
+                ]
+            )
+
+            decomp_energies = {
+                d_["material_id"]: d_["energy_above_hull"] for d_ in item["thermo_docs"]
+            }
+
+            for ient in entries:
+                ient.data["volume"] = ient.structure.volume
+                ient.data["decomposition_energy"] = decomp_energies[
+                    ient.data["material_id"]
+                ]
+
+            ie = InsertionElectrodeDoc.from_entries(
+                grouped_entries=entries,
+                working_ion_entry=working_ion_entry,
+                battery_id=item["group_id"],
+                strip_structures=self.strip_structures,
+            )
+
+            if ie is None:
+                continue
+                # {"failed_reason": "unable to create InsertionElectrode document"}
+
+            docs.append(jsanitize(ie.model_dump()))
+
+        return docs
 
     def update_targets(self, items: List):
+        if not items:
+            return
+
+        self.insertion_electrode.connect()
+
         items = list(filter(None, items))
         if len(items) > 0:
             self.logger.info("Updating {} battery documents".format(len(items)))
@@ -515,6 +553,8 @@ class InsertionElectrodeBuilder(Builder):
             self.insertion_electrode.update(docs=items, key=["battery_id"])
         else:
             self.logger.info("No items to update")
+
+        self.insertion_electrode.close()
 
 
 class ConversionElectrodeBuilder(Builder):
