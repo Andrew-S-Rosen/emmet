@@ -1,22 +1,24 @@
-from typing import Optional, Dict, Iterable
-from emmet.core.mpid import MPID
-from maggma.core.store import Store
+from typing import Dict, Iterable, Optional
+
 from maggma.core.builder import Builder
-from pymatgen.core.structure import Structure
+from maggma.core.store import Store
+from maggma.utils import grouper
 from pymatgen.analysis.elasticity.elastic import ElasticTensor
+from pymatgen.core.structure import Structure
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
+from emmet.core.mpid import MPID
 from emmet.core.substrates import SubstratesDoc
 from emmet.core.utils import jsanitize
-from maggma.utils import grouper
 
 
 class SubstratesBuilder(Builder):
     def __init__(
         self,
-        materials: Store,
-        substrates: Store,
-        elasticity: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 300,
+        allow_bson=True,
         query: Optional[Dict] = None,
         **kwargs,
     ):
@@ -30,9 +32,15 @@ class SubstratesBuilder(Builder):
             substrates_file (path): file of substrates to consider
             query (dict): dictionary to limit materials to be analyzed
         """
-        self.materials = materials
-        self.substrates = substrates
-        self.elasticity = elasticity
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.materials = source_keys["materials"]
+        self.elasticity = source_keys["elasticity"]
+        self.substrates = target_keys["substrates"]
+
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query
         self.kwargs = kwargs
 
@@ -42,8 +50,8 @@ class SubstratesBuilder(Builder):
         self.elasticity.key = "material_id"
 
         super().__init__(
-            sources=[materials, elasticity],
-            targets=[substrates],
+            sources=[self.materials, self.elasticity],
+            targets=[self.substrates],
             **kwargs,
         )
 
@@ -71,7 +79,18 @@ class SubstratesBuilder(Builder):
             )
         )
 
-        for mpid in to_process_mat_ids:
+        return [
+            to_process_mat_ids[i : i + self.chunk_size]
+            for i in range(0, len(to_process_mat_ids), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        self.materials.connect()
+        self.elasticity.connect()
+
+        all_docs = []
+
+        for mpid in mats:
             e_tensor = self.elasticity.query_one(
                 criteria={self.elasticity.key: mpid},
                 properties=["elasticity", "last_updated"],
@@ -86,17 +105,24 @@ class SubstratesBuilder(Builder):
                 properties=["structure", "deprecated", "material_id", "last_updated"],
             )
 
-            yield {
-                "structure": mat["structure"],
-                "material_id": mat[self.materials.key],
-                "elastic_tensor": e_tensor,
-                "deprecated": mat["deprecated"],
-                "last_updated": max(
-                    mat.get("last_updated"), e_tensor.get("last_updated")
-                ),
-            }
+            all_docs.append(
+                {
+                    "structure": mat["structure"],
+                    "material_id": mat[self.materials.key],
+                    "elastic_tensor": e_tensor,
+                    "deprecated": mat["deprecated"],
+                    "last_updated": max(
+                        mat.get("last_updated"), e_tensor.get("last_updated")
+                    ),
+                }
+            )
 
-    def process_item(self, item):
+        self.materials.close()
+        self.elasticity.close()
+
+        return all_docs
+
+    def process_item(self, items):
         """
         Calculates substrate matches for all given substrates
 
@@ -107,27 +133,36 @@ class SubstratesBuilder(Builder):
             dict: a diffraction dict
         """
 
-        mpid = MPID(item["material_id"])
-        elastic_tensor = item.get("elastic_tensor", None)
-        elastic_tensor = (
-            ElasticTensor.from_voigt(elastic_tensor) if elastic_tensor else None
-        )
-        deprecated = item["deprecated"]
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-        self.logger.debug("Calculating substrates for {}".format(item["task_id"]))
+            mpid = MPID(item["material_id"])
+            elastic_tensor = item.get("elastic_tensor", None)
+            elastic_tensor = (
+                ElasticTensor.from_voigt(elastic_tensor) if elastic_tensor else None
+            )
+            deprecated = item["deprecated"]
 
-        # Ensure we're using conventional standard to be consistent with IEEE elastic tensor setting
-        film = conventional_standard_structure(item)
+            self.logger.debug("Calculating substrates for {}".format(item["task_id"]))
 
-        substrate_doc = SubstratesDoc.from_structure(
-            material_id=mpid,
-            structure=film,
-            elastic_tensor=elastic_tensor,
-            deprecated=deprecated,
-            last_updated=item["last_updated"],
-        )
+            # Ensure we're using conventional standard to be consistent with IEEE elastic tensor setting
+            film = conventional_standard_structure(item)
 
-        return jsanitize(substrate_doc.model_dump(), allow_bson=True)
+            substrate_doc = SubstratesDoc.from_structure(
+                material_id=mpid,
+                structure=film,
+                elastic_tensor=elastic_tensor,
+                deprecated=deprecated,
+                last_updated=item["last_updated"],
+            )
+
+            docs.append(
+                jsanitize(substrate_doc.model_dump(), allow_bson=self.allow_bson)
+            )
+
+        return docs
 
     def update_targets(self, items):
         """
@@ -137,6 +172,11 @@ class SubstratesBuilder(Builder):
             items ([[dict]]): a list of list of thermo dictionaries to update
         """
 
+        if not items:
+            return
+
+        self.substrates.connect()
+
         items = list(filter(None, items))
 
         if len(items) > 0:
@@ -144,6 +184,8 @@ class SubstratesBuilder(Builder):
             self.substrates.update(docs=items)
         else:
             self.logger.info("No items to update")
+
+        self.substrates.close()
 
     def ensure_indicies(self):
         """
