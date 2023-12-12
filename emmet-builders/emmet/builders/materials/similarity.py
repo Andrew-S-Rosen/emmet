@@ -1,6 +1,8 @@
-import numpy as np
+from typing import Dict, Optional
 
+import numpy as np
 from maggma.builders import Builder
+from maggma.core import Store
 
 __author__ = "Nils E. R. Zimmermann <nerz@lbl.gov>"
 
@@ -10,7 +12,15 @@ __author__ = "Nils E. R. Zimmermann <nerz@lbl.gov>"
 
 
 class StructureSimilarityBuilder(Builder):
-    def __init__(self, site_descriptors, structure_similarity, fp_type="csf", **kwargs):
+    def __init__(
+        self,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        query: Optional[Dict] = None,
+        chunk_size: int = 300,
+        fp_type="csf",
+        **kwargs,
+    ):
         """
         Calculates similarity metrics between structures on the basis
         of site descriptors.
@@ -29,12 +39,21 @@ class StructureSimilarityBuilder(Builder):
                            OPSiteFingerprint class)).
         """
 
-        self.site_descriptors = site_descriptors
-        self.structure_similarity = structure_similarity
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.site_descriptors = source_keys["site_descriptors"]
+        self.structure_similarity = target_keys["structure_similarity"]
         self.fp_type = fp_type
 
+        self.chunk_size = chunk_size
+        self.query = query
+
         super().__init__(
-            sources=[site_descriptors], targets=[structure_similarity], **kwargs
+            sources=[self.site_descriptors],
+            targets=[self.structure_similarity],
+            chunk_size=self.chunk_size,
+            **kwargs,
         )
 
     def get_items(self):
@@ -52,19 +71,34 @@ class StructureSimilarityBuilder(Builder):
         # TODO: re-introduce last-updated filtering.
         task_ids = list(self.site_descriptors.distinct(self.site_descriptors.key))
         n_task_ids = len(task_ids)
-        for i in range(n_task_ids - 1):
+
+        return [
+            task_ids[i : i + self.chunk_size]
+            for i in range(0, n_task_ids, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, tasks):
+        self.site_descriptors.connect()
+
+        all_docs = []
+
+        for i in range(len(tasks) - 1):
             d1 = self.site_descriptors.query_one(
                 properties=[self.site_descriptors.key, "statistics"],
-                criteria={self.site_descriptors.key: task_ids[i]},
+                criteria={self.site_descriptors.key: tasks[i]},
             )
-            for j in range(i + 1, n_task_ids):
+            for j in range(i + 1, len(tasks)):
                 d2 = self.site_descriptors.query_one(
                     properties=[self.site_descriptors.key, "statistics"],
-                    criteria={self.site_descriptors.key: task_ids[j]},
+                    criteria={self.site_descriptors.key: tasks[j]},
                 )
-                yield list([d1, d2])
+                all_docs.append(list([d1, d2]))
 
-    def process_item(self, item):
+        self.site_descriptors.close()
+
+        return all_docs
+
+    def process_item(self, items):
         """
         Calculates site descriptors for the structures
 
@@ -77,21 +111,34 @@ class StructureSimilarityBuilder(Builder):
         Returns:
             dict: similarity measures.
         """
-        self.logger.debug(
-            "Similarities for {} and {}".format(
-                item[0][self.site_descriptors.key], item[1][self.site_descriptors.key]
-            )
-        )
 
-        sim_doc = {}
-        sim_doc = self.get_similarities(item[0], item[1])
-        sim_doc[self.structure_similarity.key] = tuple(
-            sorted(
-                [item[0][self.site_descriptors.key], item[1][self.site_descriptors.key]]
-            )
-        )
+        docs = []
 
-        return sim_doc
+        for item in items:
+            if not item:
+                continue
+
+            self.logger.debug(
+                "Similarities for {} and {}".format(
+                    item[0][self.site_descriptors.key],
+                    item[1][self.site_descriptors.key],
+                )
+            )
+
+            sim_doc = {}
+            sim_doc = self.get_similarities(item[0], item[1])
+            sim_doc[self.structure_similarity.key] = tuple(
+                sorted(
+                    [
+                        item[0][self.site_descriptors.key],
+                        item[1][self.site_descriptors.key],
+                    ]
+                )
+            )
+
+            docs.append(sim_doc)
+
+        return docs
 
     def update_targets(self, items):
         """
@@ -100,11 +147,18 @@ class StructureSimilarityBuilder(Builder):
         Args:
             items ([[dict]]): a list of list of site-descriptors dictionaries to update.
         """
+        if not items:
+            return
+
+        self.structure_similarity.connect()
+
         if len(items) > 0:
             self.logger.info("Updating {} structure-similarity docs".format(len(items)))
             self.structure_similarity.update(docs=items)
         else:
             self.logger.info("No items to update")
+
+        self.structure_similarity.close()
 
     def get_similarities(self, d1, d2):
         doc = {}
