@@ -1,14 +1,14 @@
 import tempfile
 import traceback
 from math import ceil
-from maggma.utils import grouper
-from typing import Optional, Dict, List, Iterator
+from typing import Dict, Iterator, List, Optional
 
-from abipy.dfpt.vsound import SoundVelocity as AbiSoundVelocity
 from abipy.dfpt.ddb import DdbFile
+from abipy.dfpt.vsound import SoundVelocity as AbiSoundVelocity
+from abipy.flowtk.tasks import TaskManager
 from maggma.builders import Builder
 from maggma.core import Store
-from abipy.flowtk.tasks import TaskManager
+from maggma.utils import grouper
 
 from emmet.core.phonon import SoundVelocity
 from emmet.core.utils import jsanitize
@@ -17,12 +17,13 @@ from emmet.core.utils import jsanitize
 class SoundVelocityBuilder(Builder):
     def __init__(
         self,
-        phonon_materials: Store,
-        ddb_source: Store,
-        sound_vel: Store,
-        query: Optional[dict] = None,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        query: Optional[Dict] = None,
+        chunk_size: int = 300,
+        allow_bson=True,
         manager: Optional[TaskManager] = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Creates a collection with the data of the sound velocities extracted from
@@ -37,10 +38,15 @@ class SoundVelocityBuilder(Builder):
             manager (TaskManager): an instance of the abipy TaskManager. If None it will be
                 generated from user configuration.
         """
+        self.source_keys = source_keys
+        self.target_keys = target_keys
 
-        self.phonon_materials = phonon_materials
-        self.ddb_source = ddb_source
-        self.sound_vel = sound_vel
+        self.phonon_materials = source_keys["phonon_materials"]
+        self.ddb_source = source_keys["ddb_files"]
+        self.sound_vel = target_keys["sound_velocity"]
+
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query or {}
 
         if manager is None:
@@ -49,7 +55,10 @@ class SoundVelocityBuilder(Builder):
             self.manager = manager
 
         super().__init__(
-            sources=[phonon_materials, ddb_source], targets=[sound_vel], **kwargs
+            sources=[self.phonon_materials, self.ddb_source],
+            targets=[self.sound_vel],
+            chunk_size=self.chunk_size,
+            **kwargs,
         )
 
     def prechunk(self, number_splits: int):  # pragma: no cover
@@ -94,13 +103,22 @@ class SoundVelocityBuilder(Builder):
             "Found {} new materials for sound velocity data".format(len(mats))
         )
 
+        return [
+            mats[i : i + self.chunk_size] for i in range(0, len(mats), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        self.phonon_materials.connect()
+        self.ddb_source.connect()
+
+        all_docs = []
+
         # list of properties queried from the results DB
-        # basic informations
-        projection = {"mp_id": 1}
-        # input data
-        projection["abinit_input"] = 1
-        # file ids to be fetched
-        projection["abinit_output.ddb_id"] = 1
+        projection = {
+            "mp_id": 1,  # basic information
+            "abinit_input": 1,  # input data
+            "abinit_output.ddb_id": 1,  # file ids to be fetched
+        }
 
         for m in mats:
             item = self.phonon_materials.query_one(
@@ -115,9 +133,14 @@ class SoundVelocityBuilder(Builder):
 
             item["ddb_str"] = ddb_data["data"].decode("utf-8")
 
-            yield item
+            all_docs.append(item)
 
-    def process_item(self, item: Dict) -> Optional[Dict]:
+        self.phonon_materials.close()
+        self.ddb_source.close()
+
+        return all_docs
+
+    def process_item(self, items: Dict) -> Optional[Dict]:
         """
         Generates the sound velocity document from an item
 
@@ -127,30 +150,64 @@ class SoundVelocityBuilder(Builder):
         Returns:
             dict: a dict with phonon data
         """
-        self.logger.debug("Processing sound velocity item for {}".format(item["mp_id"]))
 
-        try:
-            sound_vel_data = self.get_sound_vel(item)
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-            sv = SoundVelocity(
-                material_id=item["mp_id"],
-                structure=sound_vel_data["structure"],
-                directions=sound_vel_data["directions"],
-                labels=sound_vel_data["labels"],
-                sound_velocities=sound_vel_data["sound_velocities"],
-                mode_types=sound_vel_data["mode_types"],
+            self.logger.debug(
+                "Processing sound velocity item for {}".format(item["mp_id"])
             )
 
-            self.logger.debug("Item generated for {}".format(item["mp_id"]))
+            try:
+                sound_vel_data = self.get_sound_vel(item)
 
-            return jsanitize(sv.model_dump())
-        except Exception:
-            self.logger.warning(
-                "Error generating the sound velocity for {}: {}".format(
-                    item["mp_id"], traceback.format_exc()
+                sv = SoundVelocity(
+                    material_id=item["mp_id"],
+                    structure=sound_vel_data["structure"],
+                    directions=sound_vel_data["directions"],
+                    labels=sound_vel_data["labels"],
+                    sound_velocities=sound_vel_data["sound_velocities"],
+                    mode_types=sound_vel_data["mode_types"],
                 )
-            )
-            return None
+
+                self.logger.debug("Item generated for {}".format(item["mp_id"]))
+
+                docs.append(jsanitize(sv.model_dump()))
+            except Exception:
+                self.logger.warning(
+                    "Error generating the sound velocity for {}: {}".format(
+                        item["mp_id"], traceback.format_exc()
+                    )
+                )
+                continue
+
+        return docs
+
+    def update_targets(self, items: List[Dict]):
+        """
+        Inserts the new task_types into the task_types collection
+
+        Args:
+            items ([dict]): a list of dictionaries with sound velocities
+                to update.
+        """
+        if not items:
+            return
+
+        self.sound_vel.connect()
+
+        self.logger.debug("Start update_targets")
+        items = list(filter(None, items))
+
+        if len(items) > 0:
+            self.logger.info("Updating {} sound velocity docs".format(len(items)))
+            self.sound_vel.update(docs=items)
+        else:
+            self.logger.info("No items to update")
+
+        self.sound_vel.close()
 
     @staticmethod
     def get_sound_vel(item: Dict) -> Dict:
@@ -186,23 +243,6 @@ class SoundVelocityBuilder(Builder):
             )
 
             return sv_data
-
-    def update_targets(self, items: List[Dict]):
-        """
-        Inserts the new task_types into the task_types collection
-
-        Args:
-            items ([dict]): a list of dictionaries with sound velocities
-                to update.
-        """
-        self.logger.debug("Start update_targets")
-        items = list(filter(None, items))
-
-        if len(items) > 0:
-            self.logger.info("Updating {} sound velocity docs".format(len(items)))
-            self.sound_vel.update(docs=items)
-        else:
-            self.logger.info("No items to update")
 
     def ensure_indexes(self):
         """
