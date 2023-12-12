@@ -37,9 +37,10 @@ from emmet.core.vasp.calc_types import CalcType
 class ElasticityBuilder(Builder):
     def __init__(
         self,
-        tasks: Store,
-        materials: Store,
-        elasticity: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 200,
+        allow_bson=True,
         query: Optional[Dict] = None,
         fitting_method: str = "finite_difference",
         **kwargs,
@@ -55,15 +56,24 @@ class ElasticityBuilder(Builder):
             fitting_method: method to fit the elastic tensor: {`finite_difference`,
                 `pseudoinverse`, `independent`}
         """
+        self.source_keys = source_keys
+        self.target_keys = target_keys
 
-        self.tasks = tasks
-        self.materials = materials
-        self.elasticity = elasticity
+        self.tasks = source_keys["tasks"]
+        self.materials = source_keys["materials"]
+        self.elasticity = target_keys["elasticity"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query is not None else {}
         self.fitting_method = fitting_method
         self.kwargs = kwargs
 
-        super().__init__(sources=[tasks, materials], targets=[elasticity], **kwargs)
+        super().__init__(
+            sources=[self.tasks, self.materials],
+            targets=[self.elasticity],
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
 
     def ensure_index(self):
         self.tasks.ensure_index("nsites")
@@ -92,19 +102,32 @@ class ElasticityBuilder(Builder):
 
         self.ensure_index()
 
-        cursor = self.materials.query(
-            criteria=self.query, properties=["material_id", "calc_types", "task_ids"]
+        cursor = list(
+            self.materials.query(
+                criteria=self.query,
+                properties=["material_id", "calc_types", "task_ids"],
+            )
         )
+
+        return [
+            cursor[i : i + self.chunk_size]
+            for i in range(0, len(cursor), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        self.tasks.connect()
+
+        all_docs = []
 
         # query for tasks
         # query = self.query.copy()
         tasks_query = {}
 
-        for i, doc in enumerate(cursor):
+        for doc in mats:
             material_id = doc["material_id"]
             calc_types = {str(k): v for k, v in doc["calc_types"].items()}
 
-            self.logger.debug(f"Querying tasks for material {material_id} (index {i}).")
+            self.logger.debug(f"Querying tasks for material {material_id}).")
 
             # update query with task_ids
             try:
@@ -126,10 +149,14 @@ class ElasticityBuilder(Builder):
             task_cursor = self.tasks.query(criteria=tasks_query, properties=projections)
             tasks = list(task_cursor)
 
-            yield material_id, calc_types, tasks
+            all_docs.append((material_id, calc_types, tasks))
+
+        self.tasks.close()
+
+        return all_docs
 
     def process_item(
-        self, item: Tuple[MPID, Dict[str, str], List[Dict]]
+        self, items: List[Tuple[MPID, Dict[str, str], List[Dict]]]
     ) -> Union[Dict, None]:
         """
         Process all tasks belong to the same material into an elasticity doc.
@@ -144,81 +171,89 @@ class ElasticityBuilder(Builder):
             Elasticity doc obtained from the list of tasks. `None` if failed to
             obtain the elasticity doc from the tasks.
         """
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-        material_id, calc_types, tasks = item
+            material_id, calc_types, tasks = item
 
-        if len(tasks) != len(calc_types):
-            self.logger.error(
-                f"Number of tasks ({len(tasks)}) is not equal to number of calculation "
-                f"types ({len(calc_types)}) for material with material id "
-                f"{material_id}. Cannot proceed."
+            if len(tasks) != len(calc_types):
+                self.logger.error(
+                    f"Number of tasks ({len(tasks)}) is not equal to number of calculation "
+                    f"types ({len(calc_types)}) for material with material id "
+                    f"{material_id}. Cannot proceed."
+                )
+                return None
+
+            # filter by calc type
+            opt_tasks = filter_opt_tasks(tasks, calc_types)
+            deform_tasks = filter_deform_tasks(tasks, calc_types)
+            if not opt_tasks or not deform_tasks:
+                return None
+
+            # filter by incar
+            opt_tasks = filter_by_incar_settings(opt_tasks)
+            deform_tasks = filter_by_incar_settings(deform_tasks)
+            if not opt_tasks or not deform_tasks:
+                return None
+
+            # select one task for each set of optimization tasks with the same lattice
+            opt_grouped_tmp = group_by_parent_lattice(opt_tasks, mode="opt")
+            opt_grouped = [
+                (lattice, filter_opt_tasks_by_time(tasks, self.logger))
+                for lattice, tasks in opt_grouped_tmp
+            ]
+
+            # for deformed tasks with the same lattice, select one if there are multiple
+            # tasks with the same deformation
+            deform_grouped = group_by_parent_lattice(deform_tasks, mode="deform")
+            deform_grouped = [
+                (lattice, filter_deform_tasks_by_time(tasks, logger=self.logger))
+                for lattice, tasks in deform_grouped
+            ]
+
+            # select opt and deform tasks for fitting
+            final_opt, final_deform = select_final_opt_deform_tasks(
+                opt_grouped, deform_grouped, self.logger
             )
-            return None
+            if final_opt is None or final_deform is None:
+                return None
 
-        # filter by calc type
-        opt_tasks = filter_opt_tasks(tasks, calc_types)
-        deform_tasks = filter_deform_tasks(tasks, calc_types)
-        if not opt_tasks or not deform_tasks:
-            return None
+            # convert to elasticity doc
+            deforms = []
+            stresses = []
+            deform_task_ids = []
+            deform_dir_names = []
+            for doc in final_deform:
+                deforms.append(
+                    Deformation(doc["transformations"]["history"][0]["deformation"])
+                )
+                # 0.1 to convert to GPa from kBar, and the minus sign to flip the stress
+                # direction from compressive as positive (in vasp) to tensile as positive
+                stresses.append(-0.1 * Stress(doc["output"]["stress"]))
+                deform_task_ids.append(doc["task_id"])
+                deform_dir_names.append(doc["dir_name"])
 
-        # filter by incar
-        opt_tasks = filter_by_incar_settings(opt_tasks)
-        deform_tasks = filter_by_incar_settings(deform_tasks)
-        if not opt_tasks or not deform_tasks:
-            return None
-
-        # select one task for each set of optimization tasks with the same lattice
-        opt_grouped_tmp = group_by_parent_lattice(opt_tasks, mode="opt")
-        opt_grouped = [
-            (lattice, filter_opt_tasks_by_time(tasks, self.logger))
-            for lattice, tasks in opt_grouped_tmp
-        ]
-
-        # for deformed tasks with the same lattice, select one if there are multiple
-        # tasks with the same deformation
-        deform_grouped = group_by_parent_lattice(deform_tasks, mode="deform")
-        deform_grouped = [
-            (lattice, filter_deform_tasks_by_time(tasks, logger=self.logger))
-            for lattice, tasks in deform_grouped
-        ]
-
-        # select opt and deform tasks for fitting
-        final_opt, final_deform = select_final_opt_deform_tasks(
-            opt_grouped, deform_grouped, self.logger
-        )
-        if final_opt is None or final_deform is None:
-            return None
-
-        # convert to elasticity doc
-        deforms = []
-        stresses = []
-        deform_task_ids = []
-        deform_dir_names = []
-        for doc in final_deform:
-            deforms.append(
-                Deformation(doc["transformations"]["history"][0]["deformation"])
+            elasticity_doc = ElasticityDoc.from_deformations_and_stresses(
+                structure=Structure.from_dict(final_opt["output"]["structure"]),
+                material_id=material_id,
+                deformations=deforms,
+                stresses=stresses,
+                deformation_task_ids=deform_task_ids,
+                deformation_dir_names=deform_dir_names,
+                equilibrium_stress=-0.1 * Stress(final_opt["output"]["stress"]),
+                optimization_task_id=final_opt["task_id"],
+                optimization_dir_name=final_opt["dir_name"],
+                fitting_method="finite_difference",
             )
-            # 0.1 to convert to GPa from kBar, and the minus sign to flip the stress
-            # direction from compressive as positive (in vasp) to tensile as positive
-            stresses.append(-0.1 * Stress(doc["output"]["stress"]))
-            deform_task_ids.append(doc["task_id"])
-            deform_dir_names.append(doc["dir_name"])
+            elasticity_doc = jsanitize(
+                elasticity_doc.model_dump(), allow_bson=self.allow_bson
+            )
 
-        elasticity_doc = ElasticityDoc.from_deformations_and_stresses(
-            structure=Structure.from_dict(final_opt["output"]["structure"]),
-            material_id=material_id,
-            deformations=deforms,
-            stresses=stresses,
-            deformation_task_ids=deform_task_ids,
-            deformation_dir_names=deform_dir_names,
-            equilibrium_stress=-0.1 * Stress(final_opt["output"]["stress"]),
-            optimization_task_id=final_opt["task_id"],
-            optimization_dir_name=final_opt["dir_name"],
-            fitting_method="finite_difference",
-        )
-        elasticity_doc = jsanitize(elasticity_doc.model_dump(), allow_bson=True)
+            docs.append(elasticity_doc)
 
-        return elasticity_doc
+        return docs
 
     def update_targets(self, items: List[Dict]):
         """
@@ -227,9 +262,16 @@ class ElasticityBuilder(Builder):
         Args:
             items: elasticity docs
         """
+        if not items:
+            return
+
+        self.elasticity.connect()
+
         self.logger.info(f"Updating {len(items)} elasticity documents")
 
         self.elasticity.update(items, key="material_id")
+
+        self.elasticity.close()
 
 
 def filter_opt_tasks(
