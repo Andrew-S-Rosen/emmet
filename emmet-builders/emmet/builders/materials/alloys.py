@@ -1,19 +1,20 @@
-from itertools import combinations, chain
-from typing import Tuple, List, Dict, Union
+from itertools import chain, combinations
+from typing import Dict, List, Optional, Tuple, Union
 
-from tqdm import tqdm
 from maggma.builders import Builder
-from pymatgen.core.structure import Structure
+from maggma.core import Store
 from matminer.datasets import load_dataset
-from emmet.core.thermo import ThermoType
-
 from pymatgen.analysis.alloys.core import (
-    AlloyPair,
-    InvalidAlloy,
     KNOWN_ANON_FORMULAS,
     AlloyMember,
+    AlloyPair,
     AlloySystem,
+    InvalidAlloy,
 )
+from pymatgen.core.structure import Structure
+from tqdm import tqdm
+
+from emmet.core.thermo import ThermoType
 
 # rough sort of ANON_FORMULAS by "complexity"
 ANON_FORMULAS = sorted(KNOWN_ANON_FORMULAS, key=lambda af: len(af))
@@ -23,7 +24,7 @@ ANON_FORMULAS = sorted(KNOWN_ANON_FORMULAS, key=lambda af: len(af))
 LOOSE_SPACEGROUP_SYMPREC = 0.5
 
 # A source of effective masses, should be replaced with MP-provided effective masses.
-BOLTZTRAP_DF = load_dataset("boltztrap_mp")
+# BOLTZTRAP_DF = load_dataset("boltztrap_mp")
 
 
 class AlloyPairBuilder(Builder):
@@ -34,20 +35,25 @@ class AlloyPairBuilder(Builder):
 
     def __init__(
         self,
-        materials,
-        thermo,
-        electronic_structure,
-        provenance,
-        oxi_states,
-        alloy_pairs,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        query: Optional[Dict] = None,
+        num_phase_diagram_eles: Optional[int] = None,
+        chunk_size: int = 8,
         thermo_type: Union[ThermoType, str] = ThermoType.GGA_GGA_U_R2SCAN,
     ):
-        self.materials = materials
-        self.thermo = thermo
-        self.electronic_structure = electronic_structure
-        self.provenance = provenance
-        self.oxi_states = oxi_states
-        self.alloy_pairs = alloy_pairs
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.materials = source_keys["materials"]
+        self.thermo = source_keys["thermo"]
+        self.electronic_structure = source_keys["electronic_structure"]
+        self.provenance = source_keys["provenance"]
+        self.oxi_states = source_keys["oxi_states"]
+        self.alloy_pairs = target_keys["alloy_pairs"]
+
+        self.query = query or {}
+        self.chunk_size = chunk_size
 
         t_type = thermo_type if isinstance(thermo_type, str) else thermo_type.value
         valid_types = {*map(str, ThermoType.__members__.values())}
@@ -59,9 +65,15 @@ class AlloyPairBuilder(Builder):
         self.thermo_type = t_type
 
         super().__init__(
-            sources=[materials, thermo, electronic_structure, provenance, oxi_states],
-            targets=[alloy_pairs],
-            chunk_size=8,
+            sources=[
+                self.materials,
+                self.thermo,
+                self.electronic_structure,
+                self.provenance,
+                self.oxi_states,
+            ],
+            targets=[self.alloy_pairs],
+            chunk_size=self.chunk_size,
         )
 
     def ensure_indexes(self):
@@ -74,7 +86,21 @@ class AlloyPairBuilder(Builder):
     def get_items(self):
         self.ensure_indexes()
 
-        for idx, af in enumerate(ANON_FORMULAS):
+        return [
+            ANON_FORMULAS[i : i + self.chunk_size]
+            for i in range(0, len(ANON_FORMULAS), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, formulas):
+        self.materials.connect()
+        self.thermo.connect()
+        self.provenance.connect()
+        self.electronic_structure.connect()
+        self.oxi_states.connect()
+
+        all_docs = []
+
+        for af in formulas:
             # if af != "AB":
             #     continue
 
@@ -161,60 +187,84 @@ class AlloyPairBuilder(Builder):
                     for key in ("theoretical",):
                         d["properties"][key] = provenance_docs[material_id][key]
 
-            print(
-                f"Starting {af} with {len(docs)} materials, anonymous formula {idx} of {len(ANON_FORMULAS)}"
-            )
+            # print(
+            #     f"Starting {af} with {len(docs)} materials, anonymous formula {idx} of {len(ANON_FORMULAS)}"
+            # )
 
-            yield docs
+            all_docs.append(docs)
 
-    def process_item(self, item):
-        pairs = []
-        for mpids in tqdm(list(combinations(item.keys(), 2))):
-            if (
-                item[mpids[0]]["symmetry"]["number"]
-                == item[mpids[1]]["symmetry"]["number"]
-            ) or (
-                item[mpids[0]]["spacegroup_loose"] == item[mpids[1]]["spacegroup_loose"]
-            ):
-                # optionally, could restrict based on band gap too (e.g. at least one end-point semiconducting)
-                # if (item[mpids[0]]["band_gap"] > 0) or (item[mpids[1]]["band_gap"] > 0):
-                try:
-                    pair = AlloyPair.from_structures(
-                        structures=[
-                            item[mpids[0]]["structure"],
-                            item[mpids[1]]["structure"],
-                        ],
-                        structures_with_oxidation_states=[
-                            item[mpids[0]]["structure_oxi"],
-                            item[mpids[1]]["structure_oxi"],
-                        ],
-                        ids=[mpids[0], mpids[1]],
-                        properties=[
-                            item[mpids[0]]["properties"],
-                            item[mpids[1]]["properties"],
-                        ],
-                    )
-                    pairs.append(
-                        {
-                            "alloy_pair": pair.as_dict(),
-                            "_search": pair.search_dict(),
-                            "pair_id": pair.pair_id,
-                        }
-                    )
-                except InvalidAlloy:
-                    pass
-                except Exception as exc:
-                    print(exc)
+        self.materials.close()
+        self.thermo.close()
+        self.provenance.close()
+        self.electronic_structure.close()
+        self.oxi_states.close()
 
-        if pairs:
-            print(f"Found {len(pairs)} alloy(s)")
+        return all_docs
 
-        return pairs
+    def process_item(self, items):
+        docs = []
+        for item in items:
+            if not item:
+                continue
+
+            pairs = []
+            for mpids in tqdm(list(combinations(item.keys(), 2))):
+                if (
+                    item[mpids[0]]["symmetry"]["number"]
+                    == item[mpids[1]]["symmetry"]["number"]
+                ) or (
+                    item[mpids[0]]["spacegroup_loose"]
+                    == item[mpids[1]]["spacegroup_loose"]
+                ):
+                    # optionally, could restrict based on band gap too (e.g. at least one end-point semiconducting)
+                    # if (item[mpids[0]]["band_gap"] > 0) or (item[mpids[1]]["band_gap"] > 0):
+                    try:
+                        pair = AlloyPair.from_structures(
+                            structures=[
+                                item[mpids[0]]["structure"],
+                                item[mpids[1]]["structure"],
+                            ],
+                            structures_with_oxidation_states=[
+                                item[mpids[0]]["structure_oxi"],
+                                item[mpids[1]]["structure_oxi"],
+                            ],
+                            ids=[mpids[0], mpids[1]],
+                            properties=[
+                                item[mpids[0]]["properties"],
+                                item[mpids[1]]["properties"],
+                            ],
+                        )
+                        pairs.append(
+                            {
+                                "alloy_pair": pair.as_dict(),
+                                "_search": pair.search_dict(),
+                                "pair_id": pair.pair_id,
+                            }
+                        )
+                    except InvalidAlloy:
+                        pass
+                    except Exception as exc:
+                        print(exc)
+
+            if pairs:
+                print(f"Found {len(pairs)} alloy(s)")
+
+            docs.append(pairs)
+
+        return docs
 
     def update_targets(self, items):
-        docs = list(chain.from_iterable(items))
-        if docs:
-            self.alloy_pairs.update(docs)
+        if not items:
+            return
+
+        self.alloy_pairs.connect()
+
+        for item in items:
+            docs = list(chain.from_iterable(item))
+            if docs:
+                self.alloy_pairs.update(docs)
+
+        self.alloy_pairs.close()
 
 
 class AlloyPairMemberBuilder(Builder):
@@ -223,14 +273,26 @@ class AlloyPairMemberBuilder(Builder):
     and searches for possible members of those AlloyPairs.
     """
 
-    def __init__(self, alloy_pairs, materials, snls, alloy_pair_members):
-        self.alloy_pairs = alloy_pairs
-        self.materials = materials
-        self.snls = snls
-        self.alloy_pair_members = alloy_pair_members
+    def __init__(
+        self,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 200,
+    ):
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.alloy_pairs = source_keys["alloy_pairs"]
+        self.materials = source_keys["materials"]
+        self.snls = source_keys["snls_icsd"]
+        self.alloy_pair_members = target_keys["alloy_pair_members"]
+
+        self.chunk_size = chunk_size
 
         super().__init__(
-            sources=[alloy_pairs, materials, snls], targets=[alloy_pair_members]
+            sources=[self.alloy_pairs, self.materials, self.snls],
+            targets=[self.alloy_pair_members],
+            chunk_size=self.chunk_size,
         )
 
     def ensure_indexes(self):
@@ -253,56 +315,92 @@ class AlloyPairMemberBuilder(Builder):
             f"{len(possible_chemsys)} may have members."
         )
 
-        for idx, chemsys in enumerate(possible_chemsys):
-            pairs = self.alloy_pairs.query(criteria={"alloy_pair.chemsys": chemsys})
-            pairs = [AlloyPair.from_dict(d["alloy_pair"]) for d in pairs]
+        return [
+            possible_chemsys[i : i + self.chunk_size]
+            for i in range(0, len(possible_chemsys), self.chunk_size)
+        ]
 
-            mp_docs = self.materials.query(
-                criteria={"chemsys": chemsys, "deprecated": False},
-                properties=["structure", "material_id"],
-            )
-            mp_structures = {
-                d["material_id"]: Structure.from_dict(d["structure"]) for d in mp_docs
-            }
+    def get_processed_docs(self, mats):
+        self.alloy_pairs.connect()
+        self.materials.connect()
+        self.snls.connect()
 
-            snl_docs = self.snls.query({"chemsys": chemsys})
-            snl_structures = {d["snl_id"]: Structure.from_dict(d) for d in snl_docs}
+        all_docs = []
 
-            structures = mp_structures
-            structures.update(snl_structures)
+        for possible_chemsys in mats:
+            for idx, chemsys in enumerate(possible_chemsys):
+                pairs = self.alloy_pairs.query(criteria={"alloy_pair.chemsys": chemsys})
+                pairs = [AlloyPair.from_dict(d["alloy_pair"]) for d in pairs]
 
-            if structures:
-                yield (pairs, structures)
+                mp_docs = self.materials.query(
+                    criteria={"chemsys": chemsys, "deprecated": False},
+                    properties=["structure", "material_id"],
+                )
+                mp_structures = {
+                    d["material_id"]: Structure.from_dict(d["structure"])
+                    for d in mp_docs
+                }
 
-    def process_item(self, item: Tuple[List[AlloyPair], Dict[str, Structure]]):
-        pairs, structures = item
+                snl_docs = self.snls.query({"chemsys": chemsys})
+                snl_structures = {d["snl_id"]: Structure.from_dict(d) for d in snl_docs}
 
-        all_pair_members = []
-        for pair in pairs:
-            pair_members = {"pair_id": pair.pair_id, "members": []}
-            for db_id, structure in structures.items():
-                try:
-                    if pair.is_member(structure):
-                        db, _ = db_id.split("-")
-                        member = AlloyMember(
-                            id_=db_id,
-                            db=db,
-                            composition=structure.composition,
-                            is_ordered=structure.is_ordered,
-                            x=pair.get_x(structure.composition),
-                        )
-                        pair_members["members"].append(member.as_dict())
-                except Exception as exc:
-                    print(f"Exception for {db_id}: {exc}")
-            if pair_members["members"]:
-                all_pair_members.append(pair_members)
+                structures = mp_structures
+                structures.update(snl_structures)
 
-        return all_pair_members
+                if structures:
+                    all_docs.append((pairs, structures))
+
+        self.alloy_pairs.close()
+        self.materials.close()
+        self.snls.close()
+
+        return all_docs
+
+    def process_item(self, items: List[Tuple[List[AlloyPair], Dict[str, Structure]]]):
+        docs = []
+
+        for item in items:
+            if not item:
+                continue
+
+            pairs, structures = item
+
+            all_pair_members = []
+            for pair in pairs:
+                pair_members = {"pair_id": pair.pair_id, "members": []}
+                for db_id, structure in structures.items():
+                    try:
+                        if pair.is_member(structure):
+                            db, _ = db_id.split("-")
+                            member = AlloyMember(
+                                id_=db_id,
+                                db=db,
+                                composition=structure.composition,
+                                is_ordered=structure.is_ordered,
+                                x=pair.get_x(structure.composition),
+                            )
+                            pair_members["members"].append(member.as_dict())
+                    except Exception as exc:
+                        print(f"Exception for {db_id}: {exc}")
+                if pair_members["members"]:
+                    all_pair_members.append(pair_members)
+
+            docs.append(all_pair_members)
+
+        return docs
 
     def update_targets(self, items):
-        docs = list(chain.from_iterable(items))
-        if docs:
-            self.alloy_pair_members.update(docs)
+        if not items:
+            return
+
+        self.alloy_pair_members.connect()
+
+        for item in items:
+            docs = list(chain.from_iterable(items))
+            if docs:
+                self.alloy_pair_members.update(docs)
+
+        self.alloy_pair_members.close()
 
 
 class AlloySystemBuilder(Builder):
