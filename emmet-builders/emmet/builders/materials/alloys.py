@@ -412,21 +412,43 @@ class AlloySystemBuilder(Builder):
     """
 
     def __init__(
-        self, alloy_pairs, alloy_pair_members, alloy_pairs_merged, alloy_systems
+        self,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 8,
+        **kwargs,
     ):
-        self.alloy_pairs = alloy_pairs
-        self.alloy_pair_members = alloy_pair_members
-        self.alloy_pairs_merged = alloy_pairs_merged
-        self.alloy_systems = alloy_systems
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.alloy_pairs = source_keys["alloy_pairs"]
+        self.alloy_pair_members = source_keys["alloy_pair_members"]
+        self.alloy_pairs_merged = target_keys["alloy_pairs_merged"]
+        self.alloy_systems = target_keys["alloy_systems"]
+
+        self.chunk_size = chunk_size
+        self.kwargs = kwargs
 
         super().__init__(
-            sources=[alloy_pairs, alloy_pair_members],
-            targets=[alloy_pairs_merged, alloy_systems],
-            chunk_size=8,
+            sources=[self.alloy_pairs, self.alloy_pair_members],
+            targets=[self.alloy_pairs_merged, self.alloy_systems],
+            chunk_size=self.chunk_size,
+            **kwargs,
         )
 
     def get_items(self):
-        for idx, af in enumerate(ANON_FORMULAS):
+        return [
+            ANON_FORMULAS[i : i + self.chunk_size]
+            for i in range(0, len(ANON_FORMULAS), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, formulas):
+        self.alloy_pairs.connect()
+        self.alloy_pair_members.connect()
+
+        all_docs = []
+
+        for af in formulas:
             # comment out to only calculate a single anonymous formula for debugging
             # if af != "AB":
             #     continue
@@ -439,46 +461,68 @@ class AlloySystemBuilder(Builder):
             }
 
             if docs:
-                yield docs, members
+                all_docs.append(docs, members)
 
-    def process_item(self, item):
-        pair_docs, members = item
+        self.alloy_pairs.close()
+        self.alloy_pair_members.close()
 
-        for doc in pair_docs:
-            if doc["pair_id"] in members:
-                doc["alloy_pair"]["members"] = members[doc["pair_id"]]["members"]
-                doc["_search"]["member_ids"] = [
-                    m["id_"] for m in members[doc["pair_id"]]["members"]
-                ]
-            else:
-                doc["alloy_pair"]["members"] = []
-                doc["_search"]["member_ids"] = []
+        return all_docs
 
-        pairs = [AlloyPair.from_dict(d["alloy_pair"]) for d in pair_docs]
-        systems = AlloySystem.systems_from_pairs(pairs)
+    def process_item(self, items):
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-        system_docs = [
-            {
-                "alloy_system": system.as_dict(),
-                "alloy_id": system.alloy_id,
-                "_search": {"member_ids": [m.id_ for m in system.members]},
-            }
-            for system in systems
-        ]
+            pair_docs, members = item
 
-        for system_doc in system_docs:
-            # Too big to store, will need to reconstruct separately from pair_ids
-            system_doc["alloy_system"]["alloy_pairs"] = None
+            for doc in pair_docs:
+                if doc["pair_id"] in members:
+                    doc["alloy_pair"]["members"] = members[doc["pair_id"]]["members"]
+                    doc["_search"]["member_ids"] = [
+                        m["id_"] for m in members[doc["pair_id"]]["members"]
+                    ]
+                else:
+                    doc["alloy_pair"]["members"] = []
+                    doc["_search"]["member_ids"] = []
 
-        return pair_docs, system_docs
+            pairs = [AlloyPair.from_dict(d["alloy_pair"]) for d in pair_docs]
+            systems = AlloySystem.systems_from_pairs(pairs)
+
+            system_docs = [
+                {
+                    "alloy_system": system.as_dict(),
+                    "alloy_id": system.alloy_id,
+                    "_search": {"member_ids": [m.id_ for m in system.members]},
+                }
+                for system in systems
+            ]
+
+            for system_doc in system_docs:
+                # Too big to store, will need to reconstruct separately from pair_ids
+                system_doc["alloy_system"]["alloy_pairs"] = None
+
+            docs.append(pair_docs, system_docs)
+
+        return docs
 
     def update_targets(self, items):
-        pair_docs, system_docs = [p for p, s in items], [s for p, s in items]
+        if not items:
+            return
 
-        pair_docs = list(chain.from_iterable(pair_docs))
-        if pair_docs:
-            self.alloy_pairs_merged._collection.insert_many(pair_docs)
+        self.alloy_pairs_merged.connect()
+        self.alloy_systems.connect()
 
-        system_docs = list(chain.from_iterable(system_docs))
-        if system_docs:
-            self.alloy_systems._collection.insert_many(system_docs)
+        for item in items:
+            pair_docs, system_docs = [p for p, s in item], [s for p, s in item]
+
+            pair_docs = list(chain.from_iterable(pair_docs))
+            if pair_docs:
+                self.alloy_pairs_merged._collection.insert_many(pair_docs)
+
+            system_docs = list(chain.from_iterable(system_docs))
+            if system_docs:
+                self.alloy_systems._collection.insert_many(system_docs)
+
+        self.alloy_pairs_merged.close()
+        self.alloy_systems.close()
