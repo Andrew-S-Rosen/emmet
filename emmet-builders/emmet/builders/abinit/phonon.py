@@ -1,41 +1,39 @@
-import tempfile
 import os
+import tempfile
 from math import ceil
-from emmet.builders.settings import EmmetBuildSettings
-import numpy as np
-from typing import Optional, Dict, List, Iterator, Tuple
-from maggma.utils import grouper
+from typing import Dict, Iterator, List, Optional, Tuple
 
+import numpy as np
+from abipy.abio.inputs import AnaddbInput
+from abipy.core.abinit_units import eV_to_THz
+from abipy.dfpt.anaddbnc import AnaddbNcFile
+from abipy.dfpt.ddb import AnaddbError, DdbFile, DielectricTensorGenerator
+from abipy.dfpt.phonons import PhononBands
+from abipy.flowtk.tasks import AnaddbTask, TaskManager
+from maggma.builders import Builder
+from maggma.core import Store
+from maggma.utils import grouper
+from pymatgen.core.structure import Structure
+from pymatgen.io.abinit.abiobjects import KSampling
 from pymatgen.phonon.bandstructure import PhononBandStructureSymmLine
 from pymatgen.phonon.dos import CompletePhononDos
 from pymatgen.phonon.ir_spectra import IRDielectricTensor
-from pymatgen.core.structure import Structure
-from pymatgen.io.abinit.abiobjects import KSampling
-from pymatgen.symmetry.bandstructure import HighSymmKpath
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-from abipy.dfpt.anaddbnc import AnaddbNcFile
-from abipy.abio.inputs import AnaddbInput
-from abipy.flowtk.tasks import AnaddbTask, TaskManager
-from abipy.dfpt.ddb import AnaddbError, DielectricTensorGenerator, DdbFile
-from abipy.dfpt.phonons import PhononBands
-from abipy.core.abinit_units import eV_to_THz
-from maggma.builders import Builder
-from maggma.core import Store
+from pymatgen.symmetry.bandstructure import HighSymmKpath
 
+from emmet.builders.settings import EmmetBuildSettings
 from emmet.core.phonon import (
-    PhononWarnings,
-    ThermodynamicProperties,
     AbinitPhonon,
+    Ddb,
+    PhononBandStructure,
+    PhononDos,
+    PhononWarnings,
+    PhononWebsiteBS,
+    ThermalDisplacement,
+    ThermodynamicProperties,
     VibrationalEnergy,
 )
-from emmet.core.phonon import (
-    PhononDos,
-    PhononBandStructure,
-    PhononWebsiteBS,
-    Ddb,
-    ThermalDisplacement,
-)
-from emmet.core.polar import DielectricDoc, BornEffectiveCharges, IRDielectric
+from emmet.core.polar import BornEffectiveCharges, DielectricDoc, IRDielectric
 from emmet.core.utils import jsanitize
 
 SETTINGS = EmmetBuildSettings()
@@ -44,18 +42,13 @@ SETTINGS = EmmetBuildSettings()
 class PhononBuilder(Builder):
     def __init__(
         self,
-        phonon_materials: Store,
-        ddb_source: Store,
-        phonon: Store,
-        phonon_bs: Store,
-        phonon_dos: Store,
-        ddb_files: Store,
-        th_disp: Store,
-        phonon_website: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         query: Optional[Dict] = None,
         manager: Optional[TaskManager] = None,
         symprec: float = SETTINGS.SYMPREC,
         angle_tolerance: float = SETTINGS.ANGLE_TOL,
+        allow_bson=True,
         chunk_size=100,
         **kwargs,
     ):
@@ -93,18 +86,25 @@ class PhononBuilder(Builder):
                 determining the band structure path.
         """
 
-        self.phonon_materials = phonon_materials
-        self.phonon = phonon
-        self.ddb_source = ddb_source
-        self.phonon_bs = phonon_bs
-        self.phonon_dos = phonon_dos
-        self.ddb_files = ddb_files
-        self.th_disp = th_disp
-        self.phonon_website = phonon_website
-        self.query = query or {}
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.phonon_materials = source_keys["phonon_materials"]
+        self.ddb_source = source_keys["ddb_source"]
+
+        self.phonon = target_keys["phonon"]
+        self.phonon_bs = target_keys["phonon_bs"]
+        self.phonon_dos = target_keys["phonon_dos"]
+        self.ddb_files = target_keys["ddb_files"]
+        self.th_disp = target_keys["th_disp"]
+        self.phonon_website = target_keys["phonon_website"]
+
         self.symprec = symprec
         self.angle_tolerance = angle_tolerance
+
         self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
+        self.query = query or {}
 
         if manager is None:
             self.manager = TaskManager.from_user_config()
@@ -112,9 +112,16 @@ class PhononBuilder(Builder):
             self.manager = manager
 
         super().__init__(
-            sources=[phonon_materials, ddb_source],
-            targets=[phonon, phonon_bs, phonon_dos, ddb_files, th_disp, phonon_website],
-            chunk_size=chunk_size,
+            sources=[self.phonon_materials, self.ddb_source],
+            targets=[
+                self.phonon,
+                self.phonon_bs,
+                self.phonon_dos,
+                self.ddb_files,
+                self.th_disp,
+                self.phonon_website,
+            ],
+            chunk_size=self.chunk_size,
             **kwargs,
         )
 
@@ -155,6 +162,14 @@ class PhononBuilder(Builder):
         mats = self.phonon.newer_in(self.phonon_materials, exhaustive=True, criteria=q)
         self.logger.info("Found {} new materials for phonon data".format(len(mats)))
 
+        return [
+            mats[i : i + self.chunk_size] for i in range(0, len(mats), self.chunk_size)
+        ]
+
+    def get_processed_docs(self, mats):
+        self.phonon_materials.connect()
+        self.ddb_source.connect()
+
         # list of properties queried from the results DB
         # basic information
         projection = {
@@ -163,6 +178,8 @@ class PhononBuilder(Builder):
             "abinit_input": 1,  # input data
             "abinit_output.ddb_id": 1,  # file ids to be fetched
         }
+
+        all_docs = []
 
         for m in mats:
             item = self.phonon_materials.query_one(
@@ -188,9 +205,14 @@ class PhononBuilder(Builder):
                 )
                 continue
 
-            yield item
+            all_docs.append(item)
 
-    def process_item(self, item: Dict) -> Optional[Dict]:
+        self.phonon_materials.close()
+        self.ddb_source.close()
+
+        return all_docs
+
+    def process_item(self, items: Dict) -> Optional[Dict]:
         """
         Generates the full phonon document from an item
 
@@ -200,100 +222,151 @@ class PhononBuilder(Builder):
         Returns:
             dict: a dict with the set of phonon data to be saved in the stores.
         """
-        self.logger.debug("Processing phonon item for {}".format(item["mp_id"]))
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-        try:
-            structure = Structure.from_dict(item["abinit_input"]["structure"])
+            self.logger.debug("Processing phonon item for {}".format(item["mp_id"]))
 
-            abinit_input_vars = self.abinit_input_vars(item)
-            phonon_properties = self.get_phonon_properties(item)
-            sr_break = self.get_sum_rule_breakings(item)
-            ph_warnings = get_warnings(
-                sr_break["asr"], sr_break["cnsr"], phonon_properties["ph_bs"]
-            )
-            if PhononWarnings.NEG_FREQ not in ph_warnings:
-                thermodynamic, vibrational_energy = get_thermodynamic_properties(
-                    phonon_properties["ph_dos"]
+            try:
+                structure = Structure.from_dict(item["abinit_input"]["structure"])
+
+                abinit_input_vars = self.abinit_input_vars(item)
+                phonon_properties = self.get_phonon_properties(item)
+                sr_break = self.get_sum_rule_breakings(item)
+                ph_warnings = get_warnings(
+                    sr_break["asr"], sr_break["cnsr"], phonon_properties["ph_bs"]
                 )
-            else:
-                thermodynamic, vibrational_energy = None, None
+                if PhononWarnings.NEG_FREQ not in ph_warnings:
+                    thermodynamic, vibrational_energy = get_thermodynamic_properties(
+                        phonon_properties["ph_dos"]
+                    )
+                else:
+                    thermodynamic, vibrational_energy = None, None
 
-            becs = None
-            if phonon_properties["becs"] is not None:
-                becs = BornEffectiveCharges(
+                becs = None
+                if phonon_properties["becs"] is not None:
+                    becs = BornEffectiveCharges(
+                        material_id=item["mp_id"],
+                        symmetrized_value=phonon_properties["becs"],
+                        value=sr_break["becs_nosymm"],
+                        cnsr_break=sr_break["cnsr"],
+                    )
+
+                ap = AbinitPhonon.from_structure(
+                    structure=structure,
+                    meta_structure=structure,
+                    include_structure=True,
                     material_id=item["mp_id"],
-                    symmetrized_value=phonon_properties["becs"],
-                    value=sr_break["becs_nosymm"],
                     cnsr_break=sr_break["cnsr"],
+                    asr_break=sr_break["asr"],
+                    warnings=ph_warnings,
+                    dielectric=phonon_properties["dielectric"],
+                    becs=becs,
+                    ir_spectra=phonon_properties["ir_spectra"],
+                    thermodynamic=thermodynamic,
+                    vibrational_energy=vibrational_energy,
+                    abinit_input_vars=abinit_input_vars,
                 )
 
-            ap = AbinitPhonon.from_structure(
-                structure=structure,
-                meta_structure=structure,
-                include_structure=True,
-                material_id=item["mp_id"],
-                cnsr_break=sr_break["cnsr"],
-                asr_break=sr_break["asr"],
-                warnings=ph_warnings,
-                dielectric=phonon_properties["dielectric"],
-                becs=becs,
-                ir_spectra=phonon_properties["ir_spectra"],
-                thermodynamic=thermodynamic,
-                vibrational_energy=vibrational_energy,
-                abinit_input_vars=abinit_input_vars,
-            )
-
-            phbs = PhononBandStructure(
-                material_id=item["mp_id"],
-                band_structure=phonon_properties["ph_bs"].as_dict(),
-            )
-
-            phws = PhononWebsiteBS(
-                material_id=item["mp_id"],
-                phononwebsite=phonon_properties["ph_bs"].as_phononwebsite(),
-            )
-
-            phdos = PhononDos(
-                material_id=item["mp_id"],
-                dos=phonon_properties["ph_dos"].as_dict(),
-                dos_method=phonon_properties["ph_dos_method"],
-            )
-
-            ddb = Ddb(material_id=item["mp_id"], ddb=item["ddb_str"])
-
-            th_disp = ThermalDisplacement(
-                material_id=item["mp_id"],
-                structure=structure,
-                nsites=len(structure),
-                nomega=phonon_properties["th_disp"]["nomega"],
-                ntemp=phonon_properties["th_disp"]["ntemp"],
-                temperatures=phonon_properties["th_disp"]["tmesh"].tolist(),
-                frequencies=phonon_properties["th_disp"]["wmesh"].tolist(),
-                gdos_aijw=phonon_properties["th_disp"]["gdos_aijw"].tolist(),
-                amu=phonon_properties["th_disp"]["amu_symbol"],
-                ucif_t=phonon_properties["th_disp"]["ucif_t"].tolist(),
-                ucif_string_t300k=phonon_properties["th_disp"]["ucif_string_t300k"],
-            )
-
-            self.logger.debug("Item generated for {}".format(item["mp_id"]))
-
-            d = dict(
-                abiph=jsanitize(ap.model_dump(), allow_bson=True),
-                phbs=jsanitize(phbs.model_dump(), allow_bson=True),
-                phws=jsanitize(phws.model_dump(), allow_bson=True),
-                phdos=jsanitize(phdos.model_dump(), allow_bson=True),
-                ddb=jsanitize(ddb.model_dump(), allow_bson=True),
-                th_disp=jsanitize(th_disp.model_dump(), allow_bson=True),
-            )
-
-            return d
-        except Exception as error:
-            self.logger.warning(
-                "Error generating the phonon properties for {}: {}".format(
-                    item["mp_id"], error
+                phbs = PhononBandStructure(
+                    material_id=item["mp_id"],
+                    band_structure=phonon_properties["ph_bs"].as_dict(),
                 )
-            )
-            return None
+
+                phws = PhononWebsiteBS(
+                    material_id=item["mp_id"],
+                    phononwebsite=phonon_properties["ph_bs"].as_phononwebsite(),
+                )
+
+                phdos = PhononDos(
+                    material_id=item["mp_id"],
+                    dos=phonon_properties["ph_dos"].as_dict(),
+                    dos_method=phonon_properties["ph_dos_method"],
+                )
+
+                ddb = Ddb(material_id=item["mp_id"], ddb=item["ddb_str"])
+
+                th_disp = ThermalDisplacement(
+                    material_id=item["mp_id"],
+                    structure=structure,
+                    nsites=len(structure),
+                    nomega=phonon_properties["th_disp"]["nomega"],
+                    ntemp=phonon_properties["th_disp"]["ntemp"],
+                    temperatures=phonon_properties["th_disp"]["tmesh"].tolist(),
+                    frequencies=phonon_properties["th_disp"]["wmesh"].tolist(),
+                    gdos_aijw=phonon_properties["th_disp"]["gdos_aijw"].tolist(),
+                    amu=phonon_properties["th_disp"]["amu_symbol"],
+                    ucif_t=phonon_properties["th_disp"]["ucif_t"].tolist(),
+                    ucif_string_t300k=phonon_properties["th_disp"]["ucif_string_t300k"],
+                )
+
+                self.logger.debug("Item generated for {}".format(item["mp_id"]))
+
+                d = dict(
+                    abiph=jsanitize(ap.model_dump(), allow_bson=True),
+                    phbs=jsanitize(phbs.model_dump(), allow_bson=True),
+                    phws=jsanitize(phws.model_dump(), allow_bson=True),
+                    phdos=jsanitize(phdos.model_dump(), allow_bson=True),
+                    ddb=jsanitize(ddb.model_dump(), allow_bson=True),
+                    th_disp=jsanitize(th_disp.model_dump(), allow_bson=True),
+                )
+
+                docs.append(d)
+            except Exception as error:
+                self.logger.warning(
+                    "Error generating the phonon properties for {}: {}".format(
+                        item["mp_id"], error
+                    )
+                )
+                continue
+
+        return docs
+
+    def update_targets(self, items: List[Dict]):
+        """
+        Inserts the new task_types into the task_types collection
+
+        Args:
+            items ([dict]): a list of phonon dictionaries to update
+        """
+        if not items:
+            return
+
+        self.phonon.connect()
+        self.phonon_bs.connect()
+        self.phonon_dos.connect()
+        self.ddb_files.connect()
+        self.th_disp.connect()
+        self.phonon_website.connect()
+
+        items = list(filter(None, items))
+        items_ph = [i["abiph"] for i in items]
+        items_ph_band = [i["phbs"] for i in items]
+        items_ph_dos = [i["phdos"] for i in items]
+        items_ddb = [i["ddb"] for i in items]
+        items_th_disp = [i["th_disp"] for i in items]
+        items_ph_web = [i["phws"] for i in items]
+
+        if len(items) > 0:
+            self.logger.info("Updating {} phonon docs".format(len(items)))
+            self.phonon.update(docs=items_ph)
+            self.phonon_bs.update(docs=items_ph_band)
+            self.phonon_dos.update(docs=items_ph_dos)
+            self.ddb_files.update(docs=items_ddb)
+            self.th_disp.update(docs=items_th_disp)
+            self.phonon_website.update(docs=items_ph_web)
+
+        else:
+            self.logger.info("No items to update")
+
+        self.phonon.close()
+        self.phonon_bs.close()
+        self.phonon_dos.close()
+        self.ddb_files.close()
+        self.th_disp.close()
+        self.phonon_website.close()
 
     def get_phonon_properties(self, item: Dict) -> Dict:
         """
@@ -727,33 +800,6 @@ class PhononBuilder(Builder):
         }
 
         return data
-
-    def update_targets(self, items: List[Dict]):
-        """
-        Inserts the new task_types into the task_types collection
-
-        Args:
-            items ([dict]): a list of phonon dictionaries to update
-        """
-        items = list(filter(None, items))
-        items_ph = [i["abiph"] for i in items]
-        items_ph_band = [i["phbs"] for i in items]
-        items_ph_dos = [i["phdos"] for i in items]
-        items_ddb = [i["ddb"] for i in items]
-        items_th_disp = [i["th_disp"] for i in items]
-        items_ph_web = [i["phws"] for i in items]
-
-        if len(items) > 0:
-            self.logger.info("Updating {} phonon docs".format(len(items)))
-            self.phonon.update(docs=items_ph)
-            self.phonon_bs.update(docs=items_ph_band)
-            self.phonon_dos.update(docs=items_ph_dos)
-            self.ddb_files.update(docs=items_ddb)
-            self.th_disp.update(docs=items_th_disp)
-            self.phonon_website.update(docs=items_ph_web)
-
-        else:
-            self.logger.info("No items to update")
 
     def ensure_indexes(self):
         """
