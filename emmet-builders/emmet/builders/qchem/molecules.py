@@ -393,8 +393,10 @@ class MoleculesBuilder(Builder):
 
     def __init__(
         self,
-        assoc: Store,
-        molecules: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 300,
+        allow_bson=True,
         query: Optional[Dict] = None,
         settings: Optional[EmmetBuildSettings] = None,
         **kwargs,
@@ -407,13 +409,23 @@ class MoleculesBuilder(Builder):
             settings: EmmetSettings to use in the build process
         """
 
-        self.assoc = assoc
-        self.molecules = molecules
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.assoc = source_keys["assoc"]
+        self.molecules = target_keys["molecules"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else dict()
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
 
-        super().__init__(sources=[assoc], targets=[molecules], **kwargs)
+        super().__init__(
+            sources=[self.assoc],
+            targets=[self.molecules],
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
 
     def ensure_indexes(self):
         """
@@ -542,12 +554,29 @@ class MoleculesBuilder(Builder):
         # Set total for builder bars to have a total
         self.total = len(to_process_forms)
 
-        for formula in to_process_forms:
+        return [
+            to_process_forms[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, molecules):
+        self.assoc.connect()
+
+        all_docs = []
+
+        temp_query = dict(self.query)
+        temp_query["deprecated"] = False
+
+        for formula in molecules:
             assoc_query = dict(temp_query)
             assoc_query["formula_alphabetical"] = formula
             assoc = list(self.assoc.query(criteria=assoc_query))
 
-            yield assoc
+            all_docs += assoc
+
+        self.assoc.close()
+
+        return all_docs
 
     def process_item(self, items: List[Dict]) -> List[Dict]:
         """
@@ -559,6 +588,9 @@ class MoleculesBuilder(Builder):
         Returns:
             [dict] : a list of new molecule docs
         """
+
+        if not items:
+            return
 
         assoc = [MoleculeDoc(**item) for item in items]
         formula = assoc[0].formula_alphabetical
@@ -684,7 +716,7 @@ class MoleculesBuilder(Builder):
         self.logger.debug(f"Produced {len(complete_mol_docs)} molecules for {formula}")
 
         return jsanitize(
-            [mol.model_dump() for mol in complete_mol_docs], allow_bson=True
+            [mol.model_dump() for mol in complete_mol_docs], allow_bson=self.allow_bson
         )
 
     def update_targets(self, items: List[List[Dict]]):
@@ -694,6 +726,11 @@ class MoleculesBuilder(Builder):
         Args:
             items [[dict]]: A list of molecules to update
         """
+
+        if not items:
+            return []
+
+        self.molecules.connect()
 
         self.logger.debug(f"Updating {len(items)} molecules")
 
@@ -719,6 +756,8 @@ class MoleculesBuilder(Builder):
             )
         else:
             self.logger.info("No items to update")
+
+        self.molecules.close()
 
     def group_mol_docs(self, assoc: List[MoleculeDoc]) -> Iterator[List[MoleculeDoc]]:
         """
