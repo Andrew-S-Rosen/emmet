@@ -4,22 +4,20 @@ from math import ceil
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Union
 
 import networkx as nx
-
 from maggma.builders import Builder
 from maggma.stores import Store
 from maggma.utils import grouper
 
 from emmet.builders.settings import EmmetBuildSettings
-from emmet.core.utils import get_molecule_id, group_molecules, jsanitize, make_mol_graph
+from emmet.core.qchem.calc_types import CalcType, LevelOfTheory, TaskType
 from emmet.core.qchem.molecule import (
+    MoleculeDoc,
     best_lot,
     evaluate_lot,
     evaluate_task_entry,
-    MoleculeDoc,
 )
 from emmet.core.qchem.task import TaskDocument
-from emmet.core.qchem.calc_types import LevelOfTheory, CalcType, TaskType
-
+from emmet.core.utils import get_molecule_id, group_molecules, jsanitize, make_mol_graph
 
 __author__ = "Evan Spotte-Smith <ewcspottesmith@lbl.gov>"
 
@@ -104,8 +102,10 @@ class MoleculesAssociationBuilder(Builder):
 
     def __init__(
         self,
-        tasks: Store,
-        assoc: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 300,
+        allow_bson=True,
         query: Optional[Dict] = None,
         settings: Optional[EmmetBuildSettings] = None,
         **kwargs,
@@ -118,13 +118,23 @@ class MoleculesAssociationBuilder(Builder):
             settings: EmmetSettings to use in the build process
         """
 
-        self.tasks = tasks
-        self.assoc = assoc
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.tasks = source_keys["tasks_molecules"]
+        self.assoc = target_keys["assoc"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else dict()
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
 
-        super().__init__(sources=[tasks], targets=[assoc], **kwargs)
+        super().__init__(
+            sources=[self.tasks],
+            targets=[self.assoc],
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
 
     def ensure_indexes(self):
         """
@@ -209,6 +219,20 @@ class MoleculesAssociationBuilder(Builder):
         # Set total for builder bars to have a total
         self.total = len(to_process_hashes)
 
+        return [
+            to_process_hashes[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, hashes):
+        self.tasks.connect()
+
+        all_docs = []
+
+        # Get all processed tasks
+        temp_query = dict(self.query)
+        temp_query["state"] = "successful"
+
         projected_fields = [
             "last_updated",
             "task_id",
@@ -227,27 +251,29 @@ class MoleculesAssociationBuilder(Builder):
             "critic2",
         ]
 
-        for shash in to_process_hashes:
+        for shash in hashes:
             tasks_query = dict(temp_query)
             tasks_query["species_hash"] = shash
             tasks = list(
                 self.tasks.query(criteria=tasks_query, properties=projected_fields)
             )
-            to_yield = list()
+
             for t in tasks:
                 # TODO: Validation
                 # basic validation here ensures that tasks with invalid levels of
                 # theory don't halt the build pipeline
                 try:
                     task = TaskDocument(**t)
-                    to_yield.append(task)
+                    all_docs.append(task)
                 except Exception as e:
                     self.logger.info(
                         f"Processing task {t['task_id']} failed with Exception - {e}"
                     )
                     continue
 
-            yield to_yield
+        self.tasks.close()
+
+        return all_docs
 
     def process_item(self, tasks: List[TaskDocument]) -> List[Dict]:
         """
@@ -283,7 +309,9 @@ class MoleculesAssociationBuilder(Builder):
 
         self.logger.debug(f"Produced {len(molecules)} molecules for {shash}")
 
-        return jsanitize([mol.model_dump() for mol in molecules], allow_bson=True)
+        return jsanitize(
+            [mol.model_dump() for mol in molecules], allow_bson=self.allow_bson
+        )
 
     def update_targets(self, items: List[List[Dict]]):
         """
@@ -292,6 +320,11 @@ class MoleculesAssociationBuilder(Builder):
         Args:
             items [[dict]]: A list of molecules to update
         """
+
+        if not items:
+            return
+
+        self.assoc.connect()
 
         docs = list(chain.from_iterable(items))  # type: ignore
 
@@ -309,6 +342,8 @@ class MoleculesAssociationBuilder(Builder):
             )
         else:
             self.logger.info("No items to update")
+
+        self.assoc.close()
 
     def filter_and_group_tasks(
         self, tasks: List[TaskDocument]
