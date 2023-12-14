@@ -2,18 +2,17 @@ from collections import defaultdict
 from datetime import datetime
 from itertools import chain
 from math import ceil
-from typing import Optional, Iterable, Iterator, List, Dict
+from typing import Dict, Iterable, Iterator, List, Optional
 
 from maggma.builders import Builder
 from maggma.core import Store
 from maggma.utils import grouper
 
-from emmet.core.qchem.task import TaskDocument
-from emmet.core.qchem.molecule import MoleculeDoc, evaluate_lot
-from emmet.core.molecules.vibration import VibrationDoc
-from emmet.core.utils import jsanitize
 from emmet.builders.settings import EmmetBuildSettings
-
+from emmet.core.molecules.vibration import VibrationDoc
+from emmet.core.qchem.molecule import MoleculeDoc, evaluate_lot
+from emmet.core.qchem.task import TaskDocument
+from emmet.core.utils import jsanitize
 
 __author__ = "Evan Spotte-Smith"
 
@@ -41,21 +40,32 @@ class VibrationBuilder(Builder):
 
     def __init__(
         self,
-        tasks: Store,
-        molecules: Store,
-        vibes: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 100,
+        allow_bson=True,
         query: Optional[Dict] = None,
         settings: Optional[EmmetBuildSettings] = None,
         **kwargs,
     ):
-        self.tasks = tasks
-        self.molecules = molecules
-        self.vibes = vibes
+        self.source_keys = source_keys
+        self.target_keys = target_keys
+
+        self.tasks = source_keys["molecules_tasks"]
+        self.molecules = source_keys["molecules"]
+        self.vibes = target_keys["molecules_vibration"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else dict()
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
 
-        super().__init__(sources=[tasks, molecules], targets=[vibes], **kwargs)
+        super().__init__(
+            sources=[self.tasks, self.molecules],
+            targets=[self.vibes],
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
         # Uncomment in case of issue with mrun not connecting automatically to collections
         # for i in [self.tasks, self.molecules, self.vibes]:
         #     try:
@@ -157,12 +167,28 @@ class VibrationBuilder(Builder):
         # Set total for builder bars to have a total
         self.total = len(to_process_forms)
 
-        for formula in to_process_forms:
+        return [
+            to_process_forms[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, molecules):
+        self.molecules.connect()
+
+        all_docs = []
+
+        temp_query = dict(self.query)
+        temp_query["deprecated"] = False
+        for formula in molecules:
             mol_query = dict(temp_query)
             mol_query["formula_alphabetical"] = formula
             molecules = list(self.molecules.query(criteria=mol_query))
 
-            yield molecules
+            all_docs += molecules
+
+        self.molecules.close()
+
+        return all_docs
 
     def process_item(self, items: List[Dict]) -> List[Dict]:
         """
@@ -174,6 +200,11 @@ class VibrationBuilder(Builder):
         Returns:
             [dict] : a list of new vibration docs
         """
+
+        if not items:
+            return
+
+        self.tasks.connect()
 
         mols = [MoleculeDoc(**item) for item in items]
         formula = mols[0].formula_alphabetical
@@ -245,7 +276,11 @@ class VibrationBuilder(Builder):
 
         self.logger.debug(f"Produced {len(vibe_docs)} vibration docs for {formula}")
 
-        return jsanitize([doc.model_dump() for doc in vibe_docs], allow_bson=True)
+        self.tasks.close()
+
+        return jsanitize(
+            [doc.model_dump() for doc in vibe_docs], allow_bson=self.allow_bson
+        )
 
     def update_targets(self, items: List[List[Dict]]):
         """
@@ -254,6 +289,11 @@ class VibrationBuilder(Builder):
         Args:
             items [[dict]]: A list of documents to update
         """
+
+        if not items:
+            return
+
+        self.vibes.connect()
 
         docs = list(chain.from_iterable(items))  # type: ignore
 
@@ -276,3 +316,5 @@ class VibrationBuilder(Builder):
             )
         else:
             self.logger.info("No items to update")
+
+        self.vibes.close()
