@@ -728,7 +728,7 @@ class MoleculesBuilder(Builder):
         """
 
         if not items:
-            return []
+            return
 
         self.molecules.connect()
 
