@@ -217,6 +217,8 @@ class BondingBuilder(Builder):
         if not items:
             return
 
+        self.tasks.connect()
+
         mols = [MoleculeDoc(**item) for item in items]
         formula = mols[0].formula_alphabetical
         mol_ids = [m.molecule_id for m in mols]
@@ -318,6 +320,8 @@ class BondingBuilder(Builder):
                     bonding_docs.append(doc)
 
         self.logger.debug(f"Produced {len(bonding_docs)} bonding docs for {formula}")
+
+        self.tasks.close()
 
         return jsanitize(
             [doc.model_dump() for doc in bonding_docs], allow_bson=self.allow_bson

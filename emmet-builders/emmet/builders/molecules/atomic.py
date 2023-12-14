@@ -218,6 +218,8 @@ class PartialChargesBuilder(Builder):
         if not items:
             return
 
+        self.tasks.connect()
+
         mols = [MoleculeDoc(**item) for item in items]
         formula = mols[0].formula_alphabetical
         mol_ids = [m.molecule_id for m in mols]
@@ -301,6 +303,8 @@ class PartialChargesBuilder(Builder):
                     charges_docs.append(doc)
 
         self.logger.debug(f"Produced {len(charges_docs)} charges docs for {formula}")
+
+        self.tasks.close()
 
         return jsanitize([doc.model_dump() for doc in charges_docs], allow_bson=True)
 
@@ -532,6 +536,8 @@ class PartialSpinsBuilder(Builder):
         if not items:
             return
 
+        self.tasks.connect()
+
         mols = [MoleculeDoc(**item) for item in items]
         formula = mols[0].formula_alphabetical
         mol_ids = [m.molecule_id for m in mols]
@@ -618,6 +624,8 @@ class PartialSpinsBuilder(Builder):
         self.logger.debug(
             f"Produced {len(spins_docs)} partial spins docs for {formula}"
         )
+
+        self.tasks.close()
 
         return jsanitize(
             [doc.model_dump() for doc in spins_docs], allow_bson=self.allow_bson
