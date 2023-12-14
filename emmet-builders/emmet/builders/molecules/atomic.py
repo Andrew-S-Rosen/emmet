@@ -63,7 +63,7 @@ class PartialChargesBuilder(Builder):
         self.source_keys = source_keys
         self.target_keys = target_keys
 
-        self.tasks = source_keys["tasks"]
+        self.tasks = source_keys["molecules_tasks"]
         self.molecules = source_keys["molecules"]
         self.charges = target_keys["charges"]
         self.chunk_size = chunk_size
@@ -379,7 +379,7 @@ class PartialSpinsBuilder(Builder):
         self.source_keys = source_keys
         self.target_keys = target_keys
 
-        self.tasks = source_keys["tasks"]
+        self.tasks = source_keys["molecules_task"]
         self.molecules = source_keys["molecules"]
         self.spins = target_keys["molecules_spins"]
         self.query = query if query else dict()
