@@ -1,5 +1,5 @@
-from collections import defaultdict
 import copy
+from collections import defaultdict
 from datetime import datetime
 from itertools import chain, groupby
 from math import ceil
@@ -9,14 +9,13 @@ from maggma.builders import Builder
 from maggma.core import Store
 from maggma.utils import grouper
 
-from emmet.core.qchem.task import TaskDocument
-from emmet.core.qchem.molecule import MoleculeDoc
-from emmet.core.molecules.bonds import metals
-from emmet.core.molecules.thermo import MoleculeThermoDoc
-from emmet.core.molecules.redox import RedoxDoc
-from emmet.core.utils import confirm_molecule, get_graph_hash, jsanitize
 from emmet.builders.settings import EmmetBuildSettings
-
+from emmet.core.molecules.bonds import metals
+from emmet.core.molecules.redox import RedoxDoc
+from emmet.core.molecules.thermo import MoleculeThermoDoc
+from emmet.core.qchem.molecule import MoleculeDoc
+from emmet.core.qchem.task import TaskDocument
+from emmet.core.utils import confirm_molecule, get_graph_hash, jsanitize
 
 __author__ = "Evan Spotte-Smith"
 
@@ -47,23 +46,30 @@ class RedoxBuilder(Builder):
 
     def __init__(
         self,
-        tasks: Store,
-        molecules: Store,
-        thermo: Store,
-        redox: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 100,
+        allow_bson=True,
         query: Optional[Dict] = None,
         settings: Optional[EmmetBuildSettings] = None,
         **kwargs,
     ):
-        self.tasks = tasks
-        self.molecules = molecules
-        self.thermo = thermo
-        self.redox = redox
+        self.tasks = source_keys["molecules_tasks"]
+        self.molecules = source_keys["molecules"]
+        self.thermo = source_keys["molecules_thermo"]
+        self.redox = target_keys["molecules_redox"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else dict()
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
 
-        super().__init__(sources=[tasks, molecules, thermo], targets=[redox], **kwargs)
+        super().__init__(
+            sources=[self.tasks, self.molecules, self.thermo],
+            targets=[self.redox],
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
         # Uncomment in case of issue with mrun not connecting automatically to collections
         # for i in [self.tasks, self.molecules, self.thermo, self.redox]:
         #     try:
@@ -173,12 +179,26 @@ class RedoxBuilder(Builder):
         # Set total for builder bars to have a total
         self.total = len(to_process_forms)
 
-        for formula in to_process_forms:
+        return [
+            to_process_forms[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, molecules):
+        self.molecules.connect()
+
+        all_docs = []
+
+        temp_query = dict(self.query)
+        temp_query["deprecated"] = False
+        for formula in molecules:
             mol_query = dict(temp_query)
             mol_query["formula_alphabetical"] = formula
             molecules = list(self.molecules.query(criteria=mol_query))
 
-            yield molecules
+            all_docs += molecules
+
+        self.molecules.close()
 
     def process_item(self, items: List[Dict]) -> List[Dict]:
         """
@@ -190,6 +210,12 @@ class RedoxBuilder(Builder):
         Returns:
             [dict] : a list of new redox docs
         """
+
+        if not items:
+            return
+
+        self.tasks.connect()
+        self.thermo.connect()
 
         mols = [MoleculeDoc(**item) for item in items]
         formula = mols[0].formula_alphabetical
@@ -356,8 +382,12 @@ class RedoxBuilder(Builder):
 
         self.logger.debug(f"Produced {len(redox_docs)} redox docs for {formula}")
 
+        self.tasks.close()
+        self.thermo.close()
+
         return jsanitize(
-            [doc.model_dump() for doc in redox_docs if doc is not None], allow_bson=True
+            [doc.model_dump() for doc in redox_docs if doc is not None],
+            allow_bson=self.allow_bson,
         )
 
     def update_targets(self, items: List[List[Dict]]):
@@ -367,6 +397,11 @@ class RedoxBuilder(Builder):
         Args:
             items [[dict]]: A list of documents to update
         """
+
+        if not items:
+            return
+
+        self.redox.connect()
 
         docs = list(chain.from_iterable(items))  # type: ignore
 
@@ -389,6 +424,8 @@ class RedoxBuilder(Builder):
             )
         else:
             self.logger.info("No items to update")
+
+        self.redox.close()
 
     @staticmethod
     def _group_by_graph(mol_docs: List[MoleculeDoc]) -> Dict[int, List[MoleculeDoc]]:
