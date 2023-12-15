@@ -2,18 +2,17 @@ from collections import defaultdict
 from datetime import datetime
 from itertools import chain
 from math import ceil
-from typing import Optional, Iterable, Iterator, List, Dict
+from typing import Dict, Iterable, Iterator, List, Optional
 
 from maggma.builders import Builder
 from maggma.core import Store
 from maggma.utils import grouper
 
-from emmet.core.qchem.task import TaskDocument
-from emmet.core.qchem.molecule import MoleculeDoc, evaluate_lot
-from emmet.core.molecules.orbitals import OrbitalDoc
-from emmet.core.utils import jsanitize
 from emmet.builders.settings import EmmetBuildSettings
-
+from emmet.core.molecules.orbitals import OrbitalDoc
+from emmet.core.qchem.molecule import MoleculeDoc, evaluate_lot
+from emmet.core.qchem.task import TaskDocument
+from emmet.core.utils import jsanitize
 
 __author__ = "Evan Spotte-Smith"
 
@@ -37,21 +36,29 @@ class OrbitalBuilder(Builder):
 
     def __init__(
         self,
-        tasks: Store,
-        molecules: Store,
-        orbitals: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 100,
+        allow_bson=True,
         query: Optional[Dict] = None,
         settings: Optional[EmmetBuildSettings] = None,
         **kwargs,
     ):
-        self.tasks = tasks
-        self.molecules = molecules
-        self.orbitals = orbitals
+        self.tasks = source_keys["molecules_tasks"]
+        self.molecules = source_keys["molecules"]
+        self.orbitals = target_keys["molecules_orbitals"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else dict()
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
 
-        super().__init__(sources=[tasks, molecules], targets=[orbitals], **kwargs)
+        super().__init__(
+            sources=[self.tasks, self.molecules],
+            targets=[self.orbitals],
+            chunk_size=self.chunk_size,
+            **kwargs,
+        )
         # Uncomment in case of issue with mrun not connecting automatically to collections
         # for i in [self.tasks, self.molecules, self.orbitals]:
         #     try:
@@ -153,12 +160,28 @@ class OrbitalBuilder(Builder):
         # Set total for builder bars to have a total
         self.total = len(to_process_forms)
 
-        for formula in to_process_forms:
+        return [
+            to_process_forms[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, molecules):
+        self.molecules.connect()
+
+        all_docs = []
+
+        temp_query = dict(self.query)
+        temp_query["deprecated"] = False
+        for formula in molecules:
             mol_query = dict(temp_query)
             mol_query["formula_alphabetical"] = formula
             molecules = list(self.molecules.query(criteria=mol_query))
 
-            yield molecules
+            all_docs += molecules
+
+        self.molecules.close()
+
+        return all_docs
 
     def process_item(self, items: List[Dict]) -> List[Dict]:
         """
@@ -170,6 +193,11 @@ class OrbitalBuilder(Builder):
         Returns:
             [dict] : a list of new orbital docs
         """
+
+        if not items:
+            return
+
+        self.tasks.connect()
 
         mols = [MoleculeDoc(**item) for item in items]
         formula = mols[0].formula_alphabetical
@@ -255,7 +283,11 @@ class OrbitalBuilder(Builder):
 
         self.logger.debug(f"Produced {len(orbital_docs)} orbital docs for {formula}")
 
-        return jsanitize([doc.model_dump() for doc in orbital_docs], allow_bson=True)
+        self.tasks.close()
+
+        return jsanitize(
+            [doc.model_dump() for doc in orbital_docs], allow_bson=self.allow_bson
+        )
 
     def update_targets(self, items: List[List[Dict]]):
         """
@@ -264,6 +296,11 @@ class OrbitalBuilder(Builder):
         Args:
             items [[dict]]: A list of documents to update
         """
+
+        if not items:
+            return
+
+        self.orbitals.connect()
 
         docs = list(chain.from_iterable(items))  # type: ignore
 
@@ -286,3 +323,5 @@ class OrbitalBuilder(Builder):
             )
         else:
             self.logger.info("No items to update")
+
+        self.orbitals.close()
