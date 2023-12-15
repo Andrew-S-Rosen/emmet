@@ -1,24 +1,22 @@
+import copy
 from datetime import datetime
 from itertools import chain
 from math import ceil
-from typing import Optional, Iterable, Iterator, List, Dict
-import copy
-
-from pymatgen.core.structure import Molecule
-from pymatgen.util.graph_hashing import weisfeiler_lehman_graph_hash
+from typing import Dict, Iterable, Iterator, List, Optional
 
 from maggma.builders import Builder
 from maggma.core import Store
 from maggma.utils import grouper
+from pymatgen.core.structure import Molecule
+from pymatgen.util.graph_hashing import weisfeiler_lehman_graph_hash
 
-from emmet.core.qchem.molecule import MoleculeDoc
+from emmet.builders.settings import EmmetBuildSettings
 from emmet.core.molecules.atomic import PartialChargesDoc, PartialSpinsDoc
 from emmet.core.molecules.bonds import MoleculeBondingDoc, metals
+from emmet.core.molecules.metal_binding import METAL_BINDING_METHODS, MetalBindingDoc
 from emmet.core.molecules.thermo import MoleculeThermoDoc
-from emmet.core.molecules.metal_binding import MetalBindingDoc, METAL_BINDING_METHODS
+from emmet.core.qchem.molecule import MoleculeDoc
 from emmet.core.utils import jsanitize
-from emmet.builders.settings import EmmetBuildSettings
-
 
 __author__ = "Evan Spotte-Smith"
 
@@ -67,31 +65,32 @@ class MetalBindingBuilder(Builder):
 
     def __init__(
         self,
-        molecules: Store,
-        charges: Store,
-        spins: Store,
-        bonds: Store,
-        thermo: Store,
-        metal_binding: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 100,
+        allow_bson=True,
         query: Optional[Dict] = None,
         methods: Optional[List] = None,
         settings: Optional[EmmetBuildSettings] = None,
         **kwargs,
     ):
-        self.molecules = molecules
-        self.charges = charges
-        self.spins = spins
-        self.bonds = bonds
-        self.thermo = thermo
-        self.metal_binding = metal_binding
+        self.molecules = source_keys["molecules"]
+        self.charges = source_keys["molecules_charges"]
+        self.spins = source_keys["molecules_spins"]
+        self.bonds = source_keys["molecules_bonds"]
+        self.thermo = source_keys["molecules_thermo"]
+        self.metal_binding = target_keys["molecules_metal_binding"]
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else dict()
         self.methods = methods if methods else METAL_BINDING_METHODS
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
 
         super().__init__(
-            sources=[molecules, charges, spins, bonds, thermo],
-            targets=[metal_binding],
+            sources=[self.molecules, self.charges, self.spins, self.bonds, self.thermo],
+            targets=[self.metal_binding],
+            chunk_size=self.chunk_size,
             **kwargs,
         )
         # Uncomment in case of issue with mrun not connecting automatically to collections
@@ -226,12 +225,28 @@ class MetalBindingBuilder(Builder):
         # Set total for builder bars to have a total
         self.total = len(to_process_forms)
 
-        for formula in to_process_forms:
+        return [
+            to_process_forms[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, molecules):
+        self.molecules.connect()
+
+        all_docs = []
+
+        temp_query = dict(self.query)
+        temp_query["deprecated"] = False
+        for formula in molecules:
             mol_query = dict(temp_query)
             mol_query["formula_alphabetical"] = formula
             molecules = list(self.molecules.query(criteria=mol_query))
 
-            yield molecules
+            all_docs += molecules
+
+        self.molecules.close()
+
+        return all_docs
 
     def process_item(self, items: List[Dict]) -> List[Dict]:
         """
@@ -243,6 +258,14 @@ class MetalBindingBuilder(Builder):
         Returns:
             [dict] : a list of new metal binding docs
         """
+
+        if not items:
+            return
+
+        self.charges.connect()
+        self.bonds.connect()
+        self.spins.connect()
+        self.thermo.connect()
 
         mols = [MoleculeDoc(**item) for item in items]
         formula = mols[0].formula_alphabetical
@@ -490,7 +513,14 @@ class MetalBindingBuilder(Builder):
             f"Produced {len(binding_docs)} metal binding docs for {formula}"
         )
 
-        return jsanitize([doc.model_dump() for doc in binding_docs], allow_bson=True)
+        self.charges.close()
+        self.bonds.close()
+        self.spins.close()
+        self.thermo.close()
+
+        return jsanitize(
+            [doc.model_dump() for doc in binding_docs], allow_bson=self.allow_bson
+        )
 
     def update_targets(self, items: List[List[Dict]]):
         """
@@ -499,6 +529,11 @@ class MetalBindingBuilder(Builder):
         Args:
             items [[dict]]: A list of documents to update
         """
+
+        if not items:
+            return
+
+        self.metal_binding.connect()
 
         docs = list(chain.from_iterable(items))  # type: ignore
 
@@ -524,3 +559,5 @@ class MetalBindingBuilder(Builder):
             )
         else:
             self.logger.info("No items to update")
+
+        self.metal_binding.close()
