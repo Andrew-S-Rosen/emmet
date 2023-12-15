@@ -1,17 +1,17 @@
 from datetime import datetime
 from itertools import chain
 from math import ceil
-from typing import Any, Optional, Iterable, Iterator, List, Dict
-
-# from monty.serialization import loadfn, dumpfn
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from maggma.builders import Builder
 from maggma.core import Store
 from maggma.utils import grouper
 
+from emmet.builders.settings import EmmetBuildSettings
 from emmet.core.molecules.summary import MoleculeSummaryDoc
 from emmet.core.utils import jsanitize
-from emmet.builders.settings import EmmetBuildSettings
+
+# from monty.serialization import loadfn, dumpfn
 
 
 __author__ = "Evan Spotte-Smith"
@@ -32,47 +32,42 @@ class SummaryBuilder(Builder):
 
     def __init__(
         self,
-        molecules: Store,
-        charges: Store,
-        spins: Store,
-        bonds: Store,
-        metal_binding: Store,
-        orbitals: Store,
-        redox: Store,
-        thermo: Store,
-        vibes: Store,
-        summary: Store,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
+        chunk_size: int = 100,
+        allow_bson=True,
         query: Optional[Dict] = None,
         settings: Optional[EmmetBuildSettings] = None,
         **kwargs,
     ):
-        self.molecules = molecules
-        self.charges = charges
-        self.spins = spins
-        self.bonds = bonds
-        self.metal_binding = metal_binding
-        self.orbitals = orbitals
-        self.redox = redox
-        self.thermo = thermo
-        self.vibes = vibes
-        self.summary = summary
+        self.bonds = source_keys["molecules_bonds"]
+        self.charges = source_keys["molecules_charges"]
+        self.metal_binding = source_keys["molecules_metal_binding"]
+        self.molecules = source_keys["molecules"]
+        self.orbitals = source_keys["molecules_orbitals"]
+        self.redox = source_keys["molecules_redox"]
+        self.spins = source_keys["molecules_spins"]
+        self.thermo = source_keys["molecules_thermo"]
+        self.vibes = source_keys["molecules_vibrations"]
+        self.summary = target_keys["molecules_summary"]
         self.query = query if query else dict()
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
 
         super().__init__(
             sources=[
-                molecules,
-                charges,
-                spins,
-                bonds,
-                metal_binding,
-                orbitals,
-                redox,
-                thermo,
-                vibes,
+                self.molecules,
+                self.charges,
+                self.spins,
+                self.bonds,
+                self.metal_binding,
+                self.orbitals,
+                self.redox,
+                self.thermo,
+                self.vibes,
             ],
-            targets=[summary],
+            targets=[self.summary],
+            chunk_size=self.chunk_size,
             **kwargs,
         )
         # Uncomment in case of issue with mrun not connecting automatically to collections
@@ -252,12 +247,28 @@ class SummaryBuilder(Builder):
         # Set total for builder bars to have a total
         self.total = len(to_process_forms)
 
-        for formula in to_process_forms:
+        return [
+            to_process_forms[i : i + self.chunk_size]
+            for i in range(0, self.total, self.chunk_size)
+        ]
+
+    def get_processed_docs(self, molecules):
+        self.molecules.connect()
+
+        all_docs = []
+
+        temp_query = dict(self.query)
+        temp_query["deprecated"] = False
+        for formula in molecules:
             mol_query = dict(temp_query)
             mol_query["formula_alphabetical"] = formula
             molecules = list(self.molecules.query(criteria=mol_query))
 
-            yield molecules
+            all_docs += molecules
+
+        self.molecules.close()
+
+        return all_docs
 
     def process_item(self, items: List[Dict]) -> List[Dict]:
         """
@@ -293,6 +304,18 @@ class SummaryBuilder(Builder):
                         grouped[solvent][method] = doc
 
             return (grouped, by_method)
+
+        if not items:
+            return
+
+        self.bonds.connect()
+        self.charges.connect()
+        self.metal_binding.connect()
+        self.orbitals.connect()
+        self.redox.connect()
+        self.spins.connect()
+        self.thermo.connect()
+        self.vibes.connect()
 
         mols = items
         formula = mols[0]["formula_alphabetical"]
@@ -350,6 +373,15 @@ class SummaryBuilder(Builder):
 
         self.logger.debug(f"Produced {len(summary_docs)} summary docs for {formula}")
 
+        self.bonds.close()
+        self.charges.close()
+        self.metal_binding.close()
+        self.orbitals.close()
+        self.redox.close()
+        self.spins.close()
+        self.thermo.close()
+        self.vibes.close()
+
         return jsanitize([doc.model_dump() for doc in summary_docs], allow_bson=True)
 
     def update_targets(self, items: List[List[Dict]]):
@@ -359,6 +391,11 @@ class SummaryBuilder(Builder):
         Args:
             items [[dict]]: A list of documents to update
         """
+
+        if not items:
+            return
+
+        self.summary.connect()
 
         docs = list(chain.from_iterable(items))  # type: ignore
 
@@ -381,3 +418,5 @@ class SummaryBuilder(Builder):
             )
         else:
             self.logger.info("No items to update")
+
+        self.summary.close()
