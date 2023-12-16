@@ -1,10 +1,9 @@
-from itertools import combinations
 import itertools
+from itertools import combinations
 from math import ceil
-from typing import Dict, List, Iterator, Optional
+from typing import Dict, Iterator, List, Optional
 
-from maggma.core import Builder
-from maggma.stores import S3Store, MongoURIStore, MongoStore
+from maggma.core import Builder, Store
 from maggma.utils import grouper
 from pymatgen.core import Composition, Element
 
@@ -18,10 +17,10 @@ class MissingCompositionsBuilder(Builder):
 
     def __init__(
         self,
-        phase_diagram: S3Store,
-        mpcontribs: MongoURIStore,
-        missing_compositions: MongoStore,
+        source_keys: Dict[str, Store],
+        target_keys: Dict[str, Store],
         query: Optional[Dict] = None,
+        chunk_size: int = 1,
         **kwargs,
     ):
         """
@@ -32,9 +31,10 @@ class MissingCompositionsBuilder(Builder):
             query: dictionary to query the phase diagram store
             **kwargs: Additional keyword arguments
         """
-        self.phase_diagram = phase_diagram
-        self.mpcontribs = mpcontribs
-        self.missing_compositions = missing_compositions
+        self.phase_diagram = source_keys["phase_diagram"]
+        self.mpcontribs = source_keys["mpcontribs"]
+        self.missing_compositions = target_keys["missing_compositions"]
+        self.chunk_size = chunk_size
         self.query = query
         self.kwargs = kwargs
         # TODO: make sure the two lines below are needed?
@@ -42,8 +42,9 @@ class MissingCompositionsBuilder(Builder):
         self.missing_compositions.key = "chemical_system"
 
         super().__init__(
-            sources=[phase_diagram, mpcontribs],
-            targets=[missing_compositions],
+            sources=[self.phase_diagram, self.mpcontribs],
+            targets=[self.missing_compositions],
+            chunk_size=self.chunk_size,
             **kwargs,
         )
 
@@ -83,6 +84,13 @@ class MissingCompositionsBuilder(Builder):
             for combination in combinations(elements, r):
                 system = "-".join(sorted([str(element) for element in combination]))
                 chemical_systems.append(system)
+
+    def get_processed_docs(self, chemical_systems):
+        self.phase_diagram.connect()
+        self.mpcontribs.connect()
+
+        all_docs = []
+
         q = self.query or {}
         projection = {
             "chemsys": 1,
@@ -107,12 +115,17 @@ class MissingCompositionsBuilder(Builder):
                     "all_compositions": all_entries,
                     "matscholar_entries": matscholar_entries,
                 }
-                yield doc
+                all_docs.append(doc)
             except Exception as ex:
                 self.logger.error(f"Erro looking for phase diagram for {sys}: {ex}")
                 continue
 
-    def process_item(self, item: Dict) -> Dict:
+        self.phase_diagram.close()
+        self.mpcontribs.close()
+
+        return all_docs
+
+    def process_item(self, items: List[Dict]) -> Dict:
         """
         Processes a chemical system and finds missing c
         ompositions for that system.
@@ -121,72 +134,87 @@ class MissingCompositionsBuilder(Builder):
         in which case, it contains an empty dictionary for
         the missing_composition_entries field.
         """
-        compositions = set()
-        chemsys = item["chemsys"]
-        matscholar_entries = item["matscholar_entries"]
-        self.logger.info(
-            "Querying entries in MPContribs matscholar"
-            f"project for the chemical system {chemsys}"
-        )
-        missing_compositions = {
-            "chemical_system": chemsys,
-            "missing_composition_entries": {},
-        }
 
-        if len(item["all_compositions"]) > 0:
-            # Get the compositions from retrieved entries,
-            # and use its reduced_formula
-            for entry in item["all_compositions"]:
-                composition = Composition.from_dict(entry)
-                # Note the reduced formula is a string
-                # instead of a Composition object
-                compositions.add(composition.reduced_formula)
+        docs = []
+        for item in items:
+            if not item:
+                continue
 
-            if len(matscholar_entries) == 0:
-                self.logger.info(
-                    "No entries found in MPContribs" "for the chemical system"
-                )
+            compositions = set()
+            chemsys = item["chemsys"]
+            matscholar_entries = item["matscholar_entries"]
+            self.logger.info(
+                "Querying entries in MPContribs matscholar"
+                f"project for the chemical system {chemsys}"
+            )
+            missing_compositions = {
+                "chemical_system": chemsys,
+                "missing_composition_entries": {},
+            }
 
-            else:
-                self.logger.info(
-                    f"Found {len(matscholar_entries)}"
-                    "entries in MPContribs for the chemical system"
-                )
+            if len(item["all_compositions"]) > 0:
+                # Get the compositions from retrieved entries,
+                # and use its reduced_formula
+                for entry in item["all_compositions"]:
+                    composition = Composition.from_dict(entry)
+                    # Note the reduced formula is a string
+                    # instead of a Composition object
+                    compositions.add(composition.reduced_formula)
 
-                for entry in matscholar_entries:
-                    # Comparing reduced formulae from MPContribs
-                    # and Phase Diagram
-                    if (
-                        Composition(entry["formula"]).reduced_formula
-                        not in compositions
-                    ):
-                        # this formula doesn't exist in the dictionary,
-                        # make an entry in the missing_compositions dict
+                if len(matscholar_entries) == 0:
+                    self.logger.info(
+                        "No entries found in MPContribs" "for the chemical system"
+                    )
+
+                else:
+                    self.logger.info(
+                        f"Found {len(matscholar_entries)}"
+                        "entries in MPContribs for the chemical system"
+                    )
+
+                    for entry in matscholar_entries:
+                        # Comparing reduced formulae from MPContribs
+                        # and Phase Diagram
                         if (
-                            entry["formula"]
-                            not in missing_compositions[
-                                "missing_composition_entries"
-                            ].keys()
+                            Composition(entry["formula"]).reduced_formula
+                            not in compositions
                         ):
-                            missing_compositions["missing_composition_entries"].update(
-                                {
-                                    entry["formula"]: [
-                                        {"link": entry["link"], "doi": entry["doi"]}
-                                    ]
-                                }
-                            )
-                        # formula already exists in the dictionary, append the new entry
-                        else:
-                            missing_compositions["missing_composition_entries"][
+                            # this formula doesn't exist in the dictionary,
+                            # make an entry in the missing_compositions dict
+                            if (
                                 entry["formula"]
-                            ].append({"link": entry["link"], "doi": entry["doi"]})
+                                not in missing_compositions[
+                                    "missing_composition_entries"
+                                ].keys()
+                            ):
+                                missing_compositions[
+                                    "missing_composition_entries"
+                                ].update(
+                                    {
+                                        entry["formula"]: [
+                                            {"link": entry["link"], "doi": entry["doi"]}
+                                        ]
+                                    }
+                                )
+                            # formula already exists in the dictionary, append the new entry
+                            else:
+                                missing_compositions["missing_composition_entries"][
+                                    entry["formula"]
+                                ].append({"link": entry["link"], "doi": entry["doi"]})
 
-        return missing_compositions
+            docs.append(missing_compositions)
+
+        return docs
 
     def update_targets(self, items):
         """
         Updates the target store with the missing compositions
         """
+        if not items:
+            return
+
+        self.missing_compositions.connect()
+
         docs = list(filter(None, items))
 
         if len(docs) > 0:
@@ -194,6 +222,8 @@ class MissingCompositionsBuilder(Builder):
             self.missing_compositions.update(items)
         else:
             self.logger.info("No items to update")
+
+        self.missing_compositions.close()
 
     def _get_entries_in_chemsys(self, chemsys) -> List:
         """Queries the MPContribs Store for entries in a chemical system."""
