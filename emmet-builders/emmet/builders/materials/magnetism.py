@@ -49,7 +49,6 @@ class MagneticBuilder(Builder):
             sources=[self.materials, self.tasks],
             targets=[self.magnetism],
             chunk_size=self.chunk_size,
-            query=self.query,
             **kwargs,
         )
 
@@ -98,7 +97,7 @@ class MagneticBuilder(Builder):
 
     def get_processed_docs(self, mats):
         self.materials.connect()
-        self.task.connect()
+        self.tasks.connect()
 
         all_docs = []
 
