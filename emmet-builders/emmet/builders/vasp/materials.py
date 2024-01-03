@@ -66,8 +66,14 @@ class MaterialsBuilder(Builder):
         )
         self.materials = target_keys["materials"]
         self.query = query if query else {}
+        self.temp_query = {}
+        self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.settings = EmmetBuildSettings.autoload(settings)
         self.kwargs = kwargs
+
+        # Save timestamp to mark buildtime for material documents
+        self.timestamp = datetime.utcnow()
 
         sources = [self.tasks]
 
@@ -149,9 +155,6 @@ class MaterialsBuilder(Builder):
         self.logger.info("Setting indexes")
         self.ensure_indexes()
 
-        # Save timestamp to mark buildtime for material documents
-        self.timestamp = datetime.utcnow()
-
         # Get all processed tasks:
         self.temp_query = dict(self.query)
         self.temp_query["state"] = "successful"
@@ -183,7 +186,7 @@ class MaterialsBuilder(Builder):
         self.total = len(to_process_forms)
 
         return [
-            to_process_forms[i : i + self.chunk_size]
+            list(to_process_forms)[i : i + self.chunk_size]
             for i in range(0, len(to_process_forms), self.chunk_size)
         ]
 
@@ -307,20 +310,19 @@ class MaterialsBuilder(Builder):
 
         self.materials.connect()
 
-        for item in items:
-            docs = list(chain.from_iterable(item))  # type: ignore
+        docs = list(chain.from_iterable(items))  # type: ignore
 
-            for doc in docs:
-                doc.update({"_bt": self.timestamp})
+        for doc in docs:
+            doc.update({"_bt": self.timestamp})
 
-            material_ids = list({doc["material_id"] for doc in docs})
+        material_ids = list({doc["material_id"] for doc in docs})
 
-            if len(item) > 0:
-                self.logger.info(f"Updating {len(docs)} materials")
-                self.materials.remove_docs({self.materials.key: {"$in": material_ids}})
-                self.materials.update(docs=docs, key=["material_id"])
-            else:
-                self.logger.info("No items to update")
+        if len(docs) > 0:
+            self.logger.info(f"Updating {len(docs)} materials")
+            self.materials.remove_docs({self.materials.key: {"$in": material_ids}})
+            self.materials.update(docs=docs, key=["material_id"])
+        else:
+            self.logger.info("No items to update")
 
         self.materials.close()
 
