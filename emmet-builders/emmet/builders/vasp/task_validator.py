@@ -38,6 +38,7 @@ class TaskValidator(MapBuilder):
         self.task_validation = target_keys["task_validation"]
         self.settings = EmmetBuildSettings.autoload(settings)
         self.query = query
+        self.allow_bson = allow_bson
         self.kwargs = kwargs
         self.potcar_hashes = potcar_hashes
 
