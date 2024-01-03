@@ -30,7 +30,7 @@ class OxidationStatesBuilder(MapBuilder):
         self.target_keys = target_keys
 
         self.materials = source_keys["materials"]
-        self.oxidation_states = target_keys["oxidation_states"]
+        self.oxidation_states = target_keys["oxi_states"]
         self.query = query or {}
         self.chunk_size = chunk_size
         self.allow_bson = allow_bson
