@@ -21,7 +21,7 @@ class ChemEnvBuilder(MapBuilder):
         self.source_keys = source_keys
         self.target_keys = target_keys
 
-        self.oxidation_states = source_keys["oxidation_states"]
+        self.oxidation_states = source_keys["oxi_states"]
         self.chemenv = target_keys["chemenv"]
         self.query = query or {}
         self.chunk_size = chunk_size
@@ -35,7 +35,6 @@ class ChemEnvBuilder(MapBuilder):
             source=self.oxidation_states,
             target=self.chemenv,
             chunk_size=self.chunk_size,
-            query=self.query,
             projection=["material_id", "structure", "deprecated"],
             **kwargs
         )
