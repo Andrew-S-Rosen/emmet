@@ -36,8 +36,10 @@ class ProvenanceBuilder(Builder):
         self.source_keys = source_keys
         self.target_keys = target_keys
 
-        self.materials = source_keys.pop("materials")
-        self.source_snls = source_keys
+        self.materials = source_keys["materials"]
+        self.source_snls = [
+            val for key, val in source_keys.items() if key != "materials"
+        ]
         self.provenance = target_keys["provenance"]
         self.settings = EmmetBuildSettings.autoload(settings)
         self.chunk_size = chunk_size
@@ -51,7 +53,7 @@ class ProvenanceBuilder(Builder):
             s.key = "snl_id"
 
         super().__init__(
-            sources=[self.materials, *[val for key, val in self.source_snls.items()]],
+            sources=[self.materials, *self.source_snls],
             targets=[self.provenance],
             chunk_size=self.chunk_size,
             **kwargs,
@@ -155,7 +157,7 @@ class ProvenanceBuilder(Builder):
         self.logger.info(f"Found {self.total} new/updated systems to process")
 
         return [
-            mat_ids[i : i + self.chunk_size]
+            list(mat_ids)[i : i + self.chunk_size]
             for i in range(0, len(mat_ids), self.chunk_size)
         ]
 
@@ -163,7 +165,7 @@ class ProvenanceBuilder(Builder):
         self.materials.connect()
 
         for store in self.source_snls:
-            self.source_snls[store].connect()
+            store.connect()
 
         all_docs = []
 
@@ -200,6 +202,11 @@ class ProvenanceBuilder(Builder):
             self.logger.debug(f"Found {len(snl_structs)} potential snls for {mat_id}")
 
             all_docs.append((mat, snl_structs))
+
+        self.materials.close()
+
+        for store in self.source_snls:
+            store.close()
 
         return all_docs
 
