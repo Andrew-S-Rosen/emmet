@@ -64,6 +64,7 @@ class ElectronicStructureBuilder(Builder):
         self.bandstructure_fs = source_keys["bandstructure_fs"]
         self.dos_fs = source_keys["dos_fs"]
         self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else {}
 
         self._s3_resource = None
@@ -147,7 +148,12 @@ class ElectronicStructureBuilder(Builder):
         # find bs type for each task in task_type and store each different bs object
         self.materials.connect()
         self.tasks.connect()
-        self.bandstructure_fs.connect()
+
+        if not isinstance(self.bandstructure_fs, str):
+            self.bandstructure_fs.connect()
+
+        if not isinstance(self.dos_fs, str):
+            self.dos_fs.connect()
 
         all_docs = []
 
@@ -387,7 +393,12 @@ class ElectronicStructureBuilder(Builder):
 
         self.materials.close()
         self.tasks.close()
-        self.bandstructure_fs.close()
+
+        if not isinstance(self.bandstructure_fs, str):
+            self.bandstructure_fs.close()
+
+        if not isinstance(self.dos_fs, str):
+            self.dos_fs.close()
 
         return all_docs
 
