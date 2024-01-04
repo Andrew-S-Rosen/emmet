@@ -21,7 +21,7 @@ class RobocrystallographerBuilder(MapBuilder):
         self.source_keys = source_keys
         self.target_keys = target_keys
 
-        self.oxidation_states = source_keys["oxidation_states"]
+        self.oxidation_states = source_keys["oxi_states"]
         self.robocrys = target_keys["robocrys"]
         self.query = query or {}
         self.chunk_size = chunk_size
