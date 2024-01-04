@@ -43,7 +43,7 @@ class StructureSimilarityBuilder(Builder):
         self.target_keys = target_keys
 
         self.site_descriptors = source_keys["site_descriptors"]
-        self.structure_similarity = target_keys["structure_similarity"]
+        self.structure_similarity = target_keys["similarity"]
         self.fp_type = fp_type
 
         self.chunk_size = chunk_size
