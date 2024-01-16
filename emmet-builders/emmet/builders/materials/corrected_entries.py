@@ -55,6 +55,7 @@ class CorrectedEntriesBuilder(Builder):
         self.compatibility = compatibility or [None]
 
         self.chunk_size = chunk_size
+        self.allow_bson = allow_bson
         self.query = query if query else {}
         self._entries_cache: Dict[str, List[ComputedStructureEntry]] = defaultdict(list)
 
