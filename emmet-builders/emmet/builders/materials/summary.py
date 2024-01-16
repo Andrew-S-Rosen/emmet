@@ -41,7 +41,7 @@ class SummaryBuilder(Builder):
         self.piezoelectric = source_keys["piezoelectric"]
         self.provenance = source_keys["provenance"]
         self.substrates = source_keys["substrates"]
-        self.surface_properties = source_keys["surfaces"]
+        self.surface_properties = source_keys["surface_properties"]
         self.thermo = source_keys["thermo"]
         self.xas = source_keys["xas"]
 
@@ -101,7 +101,7 @@ class SummaryBuilder(Builder):
         self.logger.debug(f"Processing {self.total} materials.")
 
         return [
-            summary_set[i : i + self.chunk_size]
+            list(summary_set)[i : i + self.chunk_size]
             for i in range(0, self.total, self.chunk_size)
         ]
 
