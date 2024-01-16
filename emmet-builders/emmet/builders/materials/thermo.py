@@ -154,8 +154,7 @@ class ThermoBuilder(Builder):
         all_docs = []
 
         for sys in sorted(chemsys, key=lambda x: len(x.split("-")), reverse=False):
-            corrected_entries = self.corrected_entries.query_one({"chemsys": chemsys})
-
+            corrected_entries = self.corrected_entries.query_one({"chemsys": sys})
             all_docs.append(corrected_entries)
 
         self.corrected_entries.close()
@@ -300,6 +299,7 @@ class ThermoBuilder(Builder):
         }
 
         thermo_chemsys_dates = {}
+
         for d in self.thermo.query(
             {"deprecated": False},
             properties=[self.corrected_entries.key, self.thermo.last_updated_field],
