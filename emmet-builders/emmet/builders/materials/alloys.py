@@ -24,7 +24,7 @@ ANON_FORMULAS = sorted(KNOWN_ANON_FORMULAS, key=lambda af: len(af))
 LOOSE_SPACEGROUP_SYMPREC = 0.5
 
 # A source of effective masses, should be replaced with MP-provided effective masses.
-# BOLTZTRAP_DF = load_dataset("boltztrap_mp")
+BOLTZTRAP_DF = load_dataset("boltztrap_mp")
 
 
 class AlloyPairBuilder(Builder):
@@ -52,6 +52,7 @@ class AlloyPairBuilder(Builder):
         self.oxi_states = source_keys["oxi_states"]
         self.alloy_pairs = target_keys["alloy_pairs"]
 
+        self.num_phase_diagram_eles = num_phase_diagram_eles
         self.query = query or {}
         self.chunk_size = chunk_size
 
@@ -259,10 +260,10 @@ class AlloyPairBuilder(Builder):
 
         self.alloy_pairs.connect()
 
-        for item in items:
-            docs = list(chain.from_iterable(item))
-            if docs:
-                self.alloy_pairs.update(docs)
+        docs = list(chain.from_iterable(items))
+
+        if docs:
+            self.alloy_pairs.update(docs)
 
         self.alloy_pairs.close()
 
