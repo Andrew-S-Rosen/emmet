@@ -107,7 +107,7 @@ class StructureGroupBuilder(Builder):
             chunk_size (int): Size of chemsys chunks to process at any one time.
         """
         self.source_keys = source_keys
-        self.target_keys - target_keys
+        self.target_keys = target_keys
 
         self.materials = source_keys["materials"]
         self.sgroups = target_keys["insertion_electrodes_sgroups"]
