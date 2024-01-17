@@ -514,16 +514,15 @@ class AlloySystemBuilder(Builder):
         self.alloy_pairs_merged.connect()
         self.alloy_systems.connect()
 
-        for item in items:
-            pair_docs, system_docs = [p for p, s in item], [s for p, s in item]
+        pair_docs, system_docs = [p for p, s in items], [s for p, s in items]
 
-            pair_docs = list(chain.from_iterable(pair_docs))
-            if pair_docs:
-                self.alloy_pairs_merged._collection.insert_many(pair_docs)
+        pair_docs = list(chain.from_iterable(pair_docs))
+        if pair_docs:
+            self.alloy_pairs_merged._collection.insert_many(pair_docs)
 
-            system_docs = list(chain.from_iterable(system_docs))
-            if system_docs:
-                self.alloy_systems._collection.insert_many(system_docs)
+        system_docs = list(chain.from_iterable(system_docs))
+        if system_docs:
+            self.alloy_systems._collection.insert_many(system_docs)
 
         self.alloy_pairs_merged.close()
         self.alloy_systems.close()
