@@ -317,7 +317,7 @@ class AlloyPairMemberBuilder(Builder):
         )
 
         return [
-            possible_chemsys[i : i + self.chunk_size]
+            list(possible_chemsys)[i : i + self.chunk_size]
             for i in range(0, len(possible_chemsys), self.chunk_size)
         ]
 
