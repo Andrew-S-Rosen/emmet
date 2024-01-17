@@ -428,6 +428,7 @@ class InsertionElectrodeBuilder(Builder):
             return best_wion
 
         def get_thermo_docs(mat_ids):
+            self.thermo.connect()
             self.logger.debug(
                 f"Looking for {len(mat_ids)} material_id in the Thermo DB."
             )
@@ -462,6 +463,7 @@ class InsertionElectrodeBuilder(Builder):
             #         "Insertion electrode can only be defined for one working ion species"
             #     )
 
+            self.thermo.close()
             return thermo_docs
             # return {
             #     "group_id": item["group_id"],
