@@ -322,17 +322,15 @@ class StructureGroupBuilder(Builder):
 
         self.sgroups.connect()
 
-        for item in items:
-            item = list(filter(None, chain.from_iterable(item)))
-            if len(item) > 0:
-                self.logger.info("Updating {} sgroups documents".format(len(item)))
-                for struct_group_dict in item:
-                    struct_group_dict[
-                        self.sgroups.last_updated_field
-                    ] = datetime.utcnow()
-                self.sgroups.update(docs=item, key=["group_id"])
-            else:
-                self.logger.info("No item to update")
+        items = list(filter(None, chain.from_iterable(items)))
+
+        if len(items) > 0:
+            self.logger.info("Updating {} sgroups documents".format(len(items)))
+            for struct_group_dict in items:
+                struct_group_dict[self.sgroups.last_updated_field] = datetime.utcnow()
+            self.sgroups.update(docs=items, key=["group_id"])
+        else:
+            self.logger.info("No items to update")
 
         self.sgroups.close()
 
