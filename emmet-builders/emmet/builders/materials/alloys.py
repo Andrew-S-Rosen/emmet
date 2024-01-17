@@ -462,7 +462,7 @@ class AlloySystemBuilder(Builder):
             }
 
             if docs:
-                all_docs.append(docs, members)
+                all_docs.append((docs, members))
 
         self.alloy_pairs.close()
         self.alloy_pair_members.close()
@@ -503,7 +503,7 @@ class AlloySystemBuilder(Builder):
                 # Too big to store, will need to reconstruct separately from pair_ids
                 system_doc["alloy_system"]["alloy_pairs"] = None
 
-            docs.append(pair_docs, system_docs)
+            docs.append((pair_docs, system_docs))
 
         return docs
 
