@@ -340,14 +340,19 @@ class StructureGroupBuilder(Builder):
         # Note since we are just structure grouping we don't need to be careful with energy or correction
         # All of the energy analysis is left to other builders
         entries = [
-            ComputedStructureEntry.from_dict(v) for v in mdoc["entries"].values()
+            ComputedStructureEntry.from_dict(v)
+            for v in mdoc["entries"].values()
+            if v is not None
         ]
         if len(entries) == 1:
             return entries[0]
         else:
-            if "GGA+U" in mdoc["entries"].keys():
-                return ComputedStructureEntry.from_dict(mdoc["entries"]["GGA+U"])
-            elif "GGA" in mdoc["entries"].keys():
+            if (
+                "GGA_U" in mdoc["entries"].keys()
+                and mdoc["entries"]["GGA_U"] is not None
+            ):
+                return ComputedStructureEntry.from_dict(mdoc["entries"]["GGA_U"])
+            elif "GGA" in mdoc["entries"].keys() and mdoc["entries"]["GGA"] is not None:
                 return ComputedStructureEntry.from_dict(mdoc["entries"]["GGA"])
             else:
                 return None
