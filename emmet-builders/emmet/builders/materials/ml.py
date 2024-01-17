@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 
 from maggma.builders.dag_map_builder import MapBuilder
 from maggma.core import Store
-from matcalc.util import get_universal_calculator
+from matcalc.utils import get_universal_calculator
 from pymatgen.core import Structure
 
 from emmet.core.ml import MLDoc
@@ -32,7 +32,7 @@ class MLBuilder(MapBuilder):
             materials (Store): Materials to use as input structures.
             ml_potential (Store): Where to save MLDoc documents to.
             model (str | Calculator): ASE calculator or name of model to use as ML
-                potential. See matcalc.util.UNIVERSAL_CALCULATORS for recognized names.
+                potential. See matcalc.utils.UNIVERSAL_CALCULATORS for recognized names.
             model_kwargs (dict, optional): Additional kwargs to pass to the calculator.
                 Defaults to None.
             prop_kwargs (dict[str, dict], optional): Separate kwargs passed to each matcalc
@@ -40,7 +40,7 @@ class MLBuilder(MapBuilder):
                 Defaults to None.
             provenance (dict, optional): Additional provenance information to include in
                 MLDocs. Will be saved in each document so use sparingly. Defaults to None.
-                Set to {} to disable default provenance model_name, model_version, matcalc_version.
+                Set to {} to disable default provenance model, version, matcalc_version.
         """
         self.source_keys = source_keys
         self.target_keys = target_keys
@@ -63,8 +63,8 @@ class MLBuilder(MapBuilder):
             model_name = {"chgnetcalculator": "chgnet"}.get(model_name, model_name)
             pkg_name = {"m3gnet": "matgl"}.get(model_name, model_name)
             self.provenance = dict(
-                model_name=model_name,
-                model_version=version(pkg_name),
+                model=model_name,
+                version=version(pkg_name),
                 matcalc_version=version("matcalc"),
                 **(provenance or {}),
             )
