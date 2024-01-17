@@ -578,8 +578,8 @@ class ConversionElectrodeBuilder(Builder):
         self.source_keys = source_keys
         self.target_keys = target_keys
 
-        self.phase_diagram_store = source_keys["phase_diagram_store"]
-        self.conversion_electrode_store = target_keys["conversion_electrode_store"]
+        self.phase_diagram_store = source_keys["phase_diagram"]
+        self.conversion_electrode_store = target_keys["conversion_electrodes"]
         self.working_ion = working_ion
         self.thermo_type = thermo_type
         self.chunk_size = chunk_size
