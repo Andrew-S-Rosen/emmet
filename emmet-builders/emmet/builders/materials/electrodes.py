@@ -8,7 +8,6 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from maggma.builders import Builder
 from maggma.core import Store
-from maggma.stores import MongoStore
 from maggma.utils import grouper
 from pymatgen.analysis.phase_diagram import Composition, PhaseDiagram
 from pymatgen.entries.compatibility import MaterialsProject2020Compatibility
