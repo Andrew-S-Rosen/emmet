@@ -144,6 +144,10 @@ class CorrectedEntriesBuilder(Builder):
             entries = self.get_entries(chemsys)
             all_docs.append(entries)
 
+        self.materials.close()
+        if self.oxidation_states:
+            self.oxidation_states.close()
+
         return all_docs
 
     def process_item(self, items):
