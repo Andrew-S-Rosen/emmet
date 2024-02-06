@@ -153,7 +153,7 @@ class MaterialsBuilder(Builder):
         self.logger.info(f"Allowed task types: {task_types}")
 
         self.logger.info("Setting indexes")
-        self.ensure_indexes()
+        # self.ensure_indexes()
 
         # Get all processed tasks:
         self.temp_query = dict(self.query)
