@@ -118,7 +118,7 @@ class CorrectedEntriesBuilder(Builder):
         self.logger.info("Corrected Entries Builder Started")
 
         self.logger.info("Setting indexes")
-        self.ensure_indexes()
+        # self.ensure_indexes()
 
         to_process_chemsys = self._get_chemsys_to_process()
 
