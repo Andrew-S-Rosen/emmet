@@ -49,7 +49,7 @@ class RobocrystallographerBuilder(MapBuilder):
             structure=structure,
             material_id=mpid,
             deprecated=deprecated,
-            fields=[],
+            fields=["nelements", "symmetry"],
         )
 
         return jsanitize(doc.model_dump(), allow_bson=self.allow_bson)
