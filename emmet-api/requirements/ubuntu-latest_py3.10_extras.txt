@@ -75,7 +75,7 @@ deprecated==1.2.14
     # via opentelemetry-api
 distlib==0.3.8
     # via virtualenv
-dnspython==2.6.0
+dnspython==2.6.1
     # via
     #   maggma
     #   pymongo
@@ -112,7 +112,7 @@ h11==0.14.0
     # via uvicorn
 htmlmin2==0.1.13
     # via mkdocs-minify-plugin
-identify==2.5.34
+identify==2.5.35
     # via pre-commit
 idna==3.6
     # via
@@ -265,7 +265,7 @@ plotly==5.19.0
     # via pymatgen
 pluggy==1.4.0
     # via pytest
-pre-commit==3.6.1
+pre-commit==3.6.2
     # via emmet-api (setup.py)
 protobuf==4.25.3
     # via
@@ -413,9 +413,9 @@ tqdm==4.66.2
     # via
     #   maggma
     #   pymatgen
-types-requests==2.31.0.20240125
+types-requests==2.31.0.20240218
     # via emmet-api (setup.py)
-types-setuptools==69.1.0.20240215
+types-setuptools==69.1.0.20240217
     # via emmet-api (setup.py)
 typing-extensions==4.9.0
     # via

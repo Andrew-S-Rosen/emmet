@@ -61,7 +61,7 @@ ddtrace==2.6.3
     # via emmet-api (setup.py)
 deprecated==1.2.14
     # via opentelemetry-api
-dnspython==2.6.0
+dnspython==2.6.1
     # via
     #   maggma
     #   pymongo
